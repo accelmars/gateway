@@ -1,0 +1,15 @@
+[package]
+name = "accelmars-gateway"
+description = "Universal AI gateway binary — multi-provider, OpenAI-compatible, Rust-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[dependencies]
+accelmars-gateway-core = { path = "../accelmars-gateway-core" }
+clap = { version = "4", features = ["derive"] }
