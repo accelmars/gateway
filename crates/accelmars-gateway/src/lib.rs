@@ -1,5 +1,8 @@
 pub mod adapters;
+pub mod cli;
+pub mod concurrency;
 pub mod config;
+pub mod cost;
 pub mod openai;
 pub mod registry;
 pub mod router;

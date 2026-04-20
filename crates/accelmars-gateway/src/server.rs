@@ -19,6 +19,8 @@ use accelmars_gateway_core::{
     RoutingConstraints,
 };
 
+use crate::concurrency::ConcurrencyLimiter;
+use crate::cost::{CostTracker, RequestRecord};
 use crate::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice,
     ErrorDetail, ErrorResponse, StreamChoice, StreamDelta, Usage,
@@ -29,23 +31,42 @@ use crate::router::{RouteDecision, Router};
 #[derive(Clone)]
 pub struct AppState {
     pub router: Arc<Router>,
+    pub limiter: Arc<ConcurrencyLimiter>,
+    pub cost_tracker: Arc<CostTracker>,
     pub healthy: Arc<AtomicBool>,
+    pub start_time: Instant,
+    pub port: u16,
 }
 
 /// Start the gateway on the given port. Blocks until the server shuts down.
-pub async fn serve(port: u16, router: Arc<Router>) -> anyhow::Result<()> {
+pub async fn serve(
+    port: u16,
+    router: Arc<Router>,
+    limiter: Arc<ConcurrencyLimiter>,
+    cost_tracker: Arc<CostTracker>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
-    serve_with_listener(listener, router).await
+    serve_with_listener(listener, router, limiter, cost_tracker, port).await
 }
 
 /// Start the gateway on an already-bound listener.
 ///
 /// Exposed for integration tests: bind to port 0, get the assigned address, then call this.
-pub async fn serve_with_listener(listener: TcpListener, router: Arc<Router>) -> anyhow::Result<()> {
+pub async fn serve_with_listener(
+    listener: TcpListener,
+    router: Arc<Router>,
+    limiter: Arc<ConcurrencyLimiter>,
+    cost_tracker: Arc<CostTracker>,
+    port: u16,
+) -> anyhow::Result<()> {
     let healthy = Arc::new(AtomicBool::new(true));
     let state = AppState {
         router,
+        limiter,
+        cost_tracker,
         healthy: healthy.clone(),
+        start_time: Instant::now(),
+        port,
     };
 
     let addr = listener.local_addr()?;
@@ -54,6 +75,7 @@ pub async fn serve_with_listener(listener: TcpListener, router: Arc<Router>) -> 
     let app = AxumRouter::new()
         .route("/v1/chat/completions", post(handle_completion))
         .route("/health", get(handle_health))
+        .route("/status", get(handle_status))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
@@ -66,7 +88,6 @@ pub async fn serve_with_listener(listener: TcpListener, router: Arc<Router>) -> 
 }
 
 /// Waits for SIGTERM (Unix) or Ctrl-C, then marks the server unhealthy.
-/// The health endpoint returns 503 while in-flight requests drain.
 async fn shutdown_signal(healthy: Arc<AtomicBool>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -110,6 +131,28 @@ async fn handle_health(State(state): State<AppState>) -> Response {
     }
 }
 
+async fn handle_status(State(state): State<AppState>) -> Response {
+    let uptime_seconds = state.start_time.elapsed().as_secs();
+    let mode = format!("{:?}", state.router.mode()).to_lowercase();
+    let providers = state.router.provider_statuses();
+
+    let payload = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "status": "running",
+        "port": state.port,
+        "mode": mode,
+        "uptime_seconds": uptime_seconds,
+        "concurrency": {
+            "active": state.limiter.active(),
+            "available": state.limiter.available(),
+            "max": state.limiter.max()
+        },
+        "providers": providers
+    });
+
+    (StatusCode::OK, Json(payload)).into_response()
+}
+
 async fn handle_completion(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
@@ -137,6 +180,25 @@ async fn handle_completion(
 
     let constraints = parse_constraints(&req);
     let is_stream = req.stream.unwrap_or(false);
+
+    // Acquire concurrency permit — queues until a slot opens or 30s timeout → 504
+    let _permit = match state.limiter.acquire().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("concurrency queue timeout: {e}");
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ErrorResponse {
+                    error: ErrorDetail {
+                        message: e.to_string(),
+                        error_type: "rate_limit_error".to_string(),
+                        code: "concurrency_timeout".to_string(),
+                    },
+                }),
+            )
+                .into_response();
+        }
+    };
 
     // Resolve provider via router (tier + constraints → RouteDecision)
     let decision = match state.router.resolve(tier, &constraints) {
@@ -167,9 +229,11 @@ async fn handle_completion(
     };
 
     if is_stream {
-        complete_stream(decision, tier, gateway_req, state.router.clone()).await
+        complete_stream(state, decision, tier, gateway_req).await
+        // _permit dropped here — slot released after streaming completes
     } else {
-        complete_json(decision, tier, gateway_req, state.router.clone()).await
+        complete_json(state, decision, tier, gateway_req).await
+        // _permit dropped here — slot released after JSON response returned
     }
 }
 
@@ -178,23 +242,36 @@ async fn handle_completion(
 // ---------------------------------------------------------------------------
 
 async fn complete_json(
+    state: AppState,
     decision: RouteDecision,
     tier: ModelTier,
     gateway_req: GatewayRequest,
-    router: Arc<Router>,
 ) -> Response {
     let start = Instant::now();
     let provider_name = decision.provider_name.clone();
     let adapter = decision.adapter;
 
-    // ProviderAdapter::complete is sync — run on blocking thread pool
     let result = tokio::task::spawn_blocking(move || adapter.complete(&gateway_req)).await;
-    let latency_ms = start.elapsed().as_millis();
+    let latency_ms = start.elapsed().as_millis() as u64;
 
     match result {
         Err(join_err) => {
             error!("adapter task panicked: {join_err}");
-            router.on_failure(&provider_name);
+            state.router.on_failure(&provider_name);
+            state.cost_tracker.record(&RequestRecord {
+                id: new_request_id(),
+                timestamp: iso_now(),
+                tier: tier.to_string(),
+                provider: provider_name,
+                model: "unknown".to_string(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: 0.0,
+                latency_ms,
+                status: "error".to_string(),
+                error_type: Some("internal_error".to_string()),
+                constraints: None,
+            });
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::provider_error("internal error")),
@@ -210,7 +287,21 @@ async fn complete_json(
                 latency_ms,
                 "completion failed"
             );
-            router.on_failure(&provider_name);
+            state.router.on_failure(&provider_name);
+            state.cost_tracker.record(&RequestRecord {
+                id: new_request_id(),
+                timestamp: iso_now(),
+                tier: tier.to_string(),
+                provider: provider_name,
+                model: "unknown".to_string(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: 0.0,
+                latency_ms,
+                status: "error".to_string(),
+                error_type: Some(adapter_error_type(&adapter_err).to_string()),
+                constraints: None,
+            });
             (status, Json(body)).into_response()
         }
         Ok(Ok(resp)) => {
@@ -223,7 +314,31 @@ async fn complete_json(
                 tokens_out = resp.tokens_out,
                 "completion ok"
             );
-            router.on_success(&provider_name);
+            state.router.on_success(&provider_name);
+
+            let (cost_in, cost_out) = state.router.provider_pricing(&provider_name);
+            let cost_usd = CostTracker::calculate_cost(
+                resp.tokens_in as u64,
+                resp.tokens_out as u64,
+                cost_in,
+                cost_out,
+            );
+
+            state.cost_tracker.record(&RequestRecord {
+                id: resp.id.clone(),
+                timestamp: iso_now(),
+                tier: tier.to_string(),
+                provider: provider_name,
+                model: resp.model.clone(),
+                tokens_in: resp.tokens_in as u64,
+                tokens_out: resp.tokens_out as u64,
+                cost_usd,
+                latency_ms,
+                status: "ok".to_string(),
+                error_type: None,
+                constraints: None,
+            });
+
             let now = unix_now();
             (
                 StatusCode::OK,
@@ -259,22 +374,22 @@ async fn complete_json(
 // ---------------------------------------------------------------------------
 
 async fn complete_stream(
+    state: AppState,
     decision: RouteDecision,
     tier: ModelTier,
     gateway_req: GatewayRequest,
-    router: Arc<Router>,
 ) -> Response {
     let start = Instant::now();
     let provider_name = decision.provider_name.clone();
     let adapter = decision.adapter;
 
     let result = tokio::task::spawn_blocking(move || adapter.complete(&gateway_req)).await;
-    let latency_ms = start.elapsed().as_millis();
+    let latency_ms = start.elapsed().as_millis() as u64;
 
     match result {
         Err(join_err) => {
             error!("adapter task panicked: {join_err}");
-            router.on_failure(&provider_name);
+            state.router.on_failure(&provider_name);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::provider_error("internal error")),
@@ -282,12 +397,12 @@ async fn complete_stream(
                 .into_response()
         }
         Ok(Err(adapter_err)) => {
-            router.on_failure(&provider_name);
+            state.router.on_failure(&provider_name);
             let (status, body) = adapter_error_to_response(&adapter_err);
             (status, Json(body)).into_response()
         }
         Ok(Ok(resp)) => {
-            router.on_success(&provider_name);
+            state.router.on_success(&provider_name);
             info!(
                 tier = %tier,
                 provider = %provider_name,
@@ -298,9 +413,31 @@ async fn complete_stream(
                 stream = true,
                 "completion ok (stream)"
             );
+
+            let (cost_in, cost_out) = state.router.provider_pricing(&provider_name);
+            let cost_usd = CostTracker::calculate_cost(
+                resp.tokens_in as u64,
+                resp.tokens_out as u64,
+                cost_in,
+                cost_out,
+            );
+            state.cost_tracker.record(&RequestRecord {
+                id: resp.id.clone(),
+                timestamp: iso_now(),
+                tier: tier.to_string(),
+                provider: provider_name,
+                model: resp.model.clone(),
+                tokens_in: resp.tokens_in as u64,
+                tokens_out: resp.tokens_out as u64,
+                cost_usd,
+                latency_ms,
+                status: "ok".to_string(),
+                error_type: None,
+                constraints: None,
+            });
+
             let now = unix_now();
 
-            // Content chunk
             let content_chunk = ChatCompletionChunk {
                 id: resp.id.clone(),
                 object: "chat.completion.chunk".to_string(),
@@ -316,7 +453,6 @@ async fn complete_stream(
                 }],
             };
 
-            // Finish chunk
             let finish_chunk = ChatCompletionChunk {
                 id: resp.id,
                 object: "chat.completion.chunk".to_string(),
@@ -450,9 +586,86 @@ fn adapter_error_to_response(err: &AdapterError) -> (StatusCode, ErrorResponse) 
     }
 }
 
+fn adapter_error_type(err: &AdapterError) -> &'static str {
+    match err {
+        AdapterError::RateLimit { .. } => "rate_limit",
+        AdapterError::AuthError(_) => "auth_error",
+        AdapterError::Timeout => "timeout",
+        AdapterError::ProviderError(_) => "provider_error",
+        AdapterError::ParseError(_) => "parse_error",
+    }
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn iso_now() -> String {
+    // RFC 3339 / ISO 8601 UTC
+    chrono_from_secs(unix_now())
+}
+
+fn chrono_from_secs(secs: u64) -> String {
+    // Minimal ISO timestamp without pulling in chrono.
+    // Format: "YYYY-MM-DDTHH:MM:SSZ"
+    let s = secs;
+    let (y, mo, d, h, mi, sec) = epoch_to_datetime(s);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{sec:02}Z")
+}
+
+/// Minimal epoch → (year, month, day, hour, min, sec) without external crates.
+fn epoch_to_datetime(epoch: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let sec = (epoch % 60) as u32;
+    let epoch = epoch / 60;
+    let min = (epoch % 60) as u32;
+    let epoch = epoch / 60;
+    let hour = (epoch % 24) as u32;
+    let mut days = epoch / 24;
+
+    // Days since 1970-01-01
+    let mut year = 1970u32;
+    loop {
+        let days_in_year = if is_leap(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+    let leap = is_leap(year);
+    let month_days = [
+        31u64,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 1u32;
+    for &md in &month_days {
+        if days < md {
+            break;
+        }
+        days -= md;
+        month += 1;
+    }
+    (year, month, days as u32 + 1, hour, min, sec)
+}
+
+fn is_leap(year: u32) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+}
+
+fn new_request_id() -> String {
+    use uuid::Uuid;
+    Uuid::new_v4().to_string()
 }
