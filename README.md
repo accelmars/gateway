@@ -1,18 +1,18 @@
 # AccelMars Gateway
 
-> Universal AI gateway — route any AI call through one service.
+> Route all your AI calls through one service.
 
 [![CI](https://github.com/accelmars/gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/accelmars/gateway/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-A high-performance, OpenAI-compatible AI gateway written in Rust. Every AccelMars engine routes AI calls through here — one service, multi-provider, configurable quality tiers, no provider lock-in.
+A high-performance, OpenAI-compatible AI gateway written in Rust. One service, multi-provider, configurable quality tiers, no provider lock-in.
 
 ---
 
 ## Architecture
 
 ```
-Engine (cortex, pact, canon, ...)
+Your application
   │
   │  POST /v1/chat/completions  {"model": "quick", ...}
   ▼
@@ -25,7 +25,7 @@ accelmars/gateway
   └── GATEWAY_MODE=mock → deterministic responses ($0)
 ```
 
-Engines have **zero AI SDK dependencies**. They POST standard HTTP to the gateway. The gateway decides which provider to use based on tier and routing constraints.
+Clients have **zero AI SDK dependencies**. They POST standard HTTP to the gateway. The gateway decides which provider to use based on tier and routing constraints.
 
 ---
 
@@ -39,8 +39,8 @@ brew install accelmars/tap/gateway   # macOS (Homebrew)
 # Start the gateway
 gateway serve
 
-# All engines in your project now route through it
-export ACCELMARS_GATEWAY_URL=http://localhost:8080
+# Point your app at it
+export GATEWAY_URL=http://localhost:8080
 ```
 
 ---
@@ -56,7 +56,7 @@ Express what quality level you need — the gateway picks the provider:
 | **max** | `ModelTier::Max` | Claude Sonnet | ~$3/M tokens |
 | **ultra** | `ModelTier::Ultra` | Claude Opus | ~$5/M tokens |
 
-Tier-to-provider mapping is config-driven — swap providers without changing engine code.
+Tier-to-provider mapping is config-driven — swap providers without changing client code.
 
 ---
 
@@ -90,11 +90,11 @@ Orthogonal to quality tier — express HOW to route:
 
 | Provider | Status | Notes |
 |----------|--------|-------|
-| **Gemini** | Phase 1 (PF-003) | Free tier available |
-| **DeepSeek** | Phase 1 (PF-003) | Very cost-effective |
-| **Claude (Anthropic)** | Phase 1 (PF-003) | Quality-critical work |
-| **OpenAI** | Phase 1 (PF-003) | Optional |
-| **Mock** | Scaffold | Tests + CI, deterministic |
+| **Gemini** | Planned | Free tier available |
+| **DeepSeek** | Planned | Very cost-effective |
+| **Claude (Anthropic)** | Planned | Quality-critical work |
+| **OpenAI** | Planned | Optional |
+| **Mock** | Built-in | Tests + CI, deterministic |
 
 ---
 
@@ -104,7 +104,7 @@ Orthogonal to quality tier — express HOW to route:
 GATEWAY_MODE=mock gateway serve
 ```
 
-All engines automatically use deterministic responses. No API keys. No cost. Perfect for CI.
+All clients get deterministic responses. No API keys. No cost. Perfect for CI.
 
 ---
 
@@ -126,6 +126,14 @@ response = client.chat.completions.create(
 )
 ```
 
+Or with curl:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "quick", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
 ---
 
 ## Development
@@ -139,11 +147,5 @@ cargo fmt --check
 
 ---
 
-## Related
-
-- [accelmars/contract-spec](https://github.com/accelmars/contract-spec) — contract specification standard
-- [accelmars/pact](https://github.com/accelmars/pact) — pact contract engine
-
----
-
-_AccelMars Co., Ltd. — Apache 2.0_
+_Built by [AccelMars](https://github.com/accelmars) — Apache 2.0_
+_See also: [contract-spec](https://github.com/accelmars/contract-spec) · [pact](https://github.com/accelmars/pact)_
