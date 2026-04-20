@@ -5,7 +5,9 @@ use clap::{Parser, Subcommand};
 use accelmars_gateway::adapters::{
     new_deepseek_adapter, new_groq_adapter, new_openrouter_adapter, ClaudeAdapter, GeminiAdapter,
 };
+use accelmars_gateway::config::GatewayConfig;
 use accelmars_gateway::registry::AdapterRegistry;
+use accelmars_gateway::router::Router;
 use accelmars_gateway::server;
 use accelmars_gateway_core::MockAdapter;
 
@@ -29,9 +31,12 @@ struct Cli {
 enum Commands {
     /// Start the gateway HTTP server (OpenAI-compatible API)
     Serve {
-        /// Port to listen on
-        #[arg(long, default_value = "8080", env = "GATEWAY_PORT")]
-        port: u16,
+        /// Port to listen on (overrides config file and GATEWAY__PORT)
+        #[arg(long, env = "GATEWAY_PORT")]
+        port: Option<u16>,
+        /// Path to config file (default: gateway.toml in CWD)
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
     },
     /// Show gateway health and provider availability
     Status,
@@ -44,41 +49,39 @@ enum Commands {
     },
 }
 
-fn build_registry() -> AdapterRegistry {
-    let mut registry = AdapterRegistry::new();
-    let mode = std::env::var("GATEWAY_MODE").unwrap_or_default();
+fn build_registry_from_config(config: &GatewayConfig) -> AdapterRegistry {
+    use accelmars_gateway::config::GatewayMode;
 
-    // Mock adapter — always registered
+    let mut registry = AdapterRegistry::new();
+
+    // Mock adapter — always registered (used by mock mode + fallback)
     registry.register(Arc::new(MockAdapter::default()));
 
-    if mode == "mock" {
+    if config.mode == GatewayMode::Mock {
         tracing::info!("GATEWAY_MODE=mock — mock adapter only");
         return registry;
     }
 
-    // Gemini (free tier) — GEMINI_API_KEY
-    let gemini_key = std::env::var("GEMINI_API_KEY").ok();
-    let gemini_model =
-        std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".to_string());
-    registry.register(Arc::new(GeminiAdapter::new(gemini_key, gemini_model)));
-
-    // DeepSeek — DEEPSEEK_API_KEY
-    let deepseek_key = std::env::var("DEEPSEEK_API_KEY").ok();
-    registry.register(Arc::new(new_deepseek_adapter(deepseek_key)));
-
-    // Claude (Anthropic) — ANTHROPIC_API_KEY
-    let claude_key = std::env::var("ANTHROPIC_API_KEY").ok();
-    let claude_model =
-        std::env::var("CLAUDE_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
-    registry.register(Arc::new(ClaudeAdapter::new(claude_key, claude_model)));
-
-    // OpenRouter — OPENROUTER_API_KEY
-    let openrouter_key = std::env::var("OPENROUTER_API_KEY").ok();
-    registry.register(Arc::new(new_openrouter_adapter(openrouter_key)));
-
-    // Groq — GROQ_API_KEY
-    let groq_key = std::env::var("GROQ_API_KEY").ok();
-    registry.register(Arc::new(new_groq_adapter(groq_key)));
+    // Register adapters for each configured provider
+    for (name, provider_cfg) in &config.providers {
+        let api_key = std::env::var(&provider_cfg.api_key_env).ok();
+        let adapter: Arc<dyn accelmars_gateway_core::ProviderAdapter> = match name.as_str() {
+            n if n.starts_with("gemini") => {
+                Arc::new(GeminiAdapter::new(api_key, provider_cfg.model.clone()))
+            }
+            "deepseek" => Arc::new(new_deepseek_adapter(api_key)),
+            n if n.starts_with("claude") => {
+                Arc::new(ClaudeAdapter::new(api_key, provider_cfg.model.clone()))
+            }
+            n if n.starts_with("openrouter") => Arc::new(new_openrouter_adapter(api_key)),
+            n if n.starts_with("groq") => Arc::new(new_groq_adapter(api_key)),
+            _ => {
+                tracing::warn!(provider = name, "unknown provider type — skipping");
+                continue;
+            }
+        };
+        registry.register(adapter);
+    }
 
     let available = registry.available();
     let all = registry.all_providers();
@@ -101,10 +104,39 @@ async fn main() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     match cli.command {
-        Some(Commands::Serve { port }) => {
-            let registry = Arc::new(build_registry());
+        Some(Commands::Serve { port, config }) => {
+            let config_path = config.as_deref();
+            let mut gateway_config = match GatewayConfig::load(config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("failed to load config: {e:#}");
+                    std::process::exit(1);
+                }
+            };
 
-            if let Err(e) = server::serve(port, registry).await {
+            // CLI --port overrides config file
+            if let Some(p) = port {
+                gateway_config.port = p;
+            }
+
+            // Validate config (warnings logged; only fatal if zero providers)
+            match gateway_config.validate() {
+                Ok(warnings) => {
+                    for w in &warnings {
+                        tracing::warn!("{w}");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("config validation failed: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+
+            let serve_port = gateway_config.port;
+            let registry = build_registry_from_config(&gateway_config);
+            let router = Arc::new(Router::new(gateway_config, registry));
+
+            if let Err(e) = server::serve(serve_port, router).await {
                 tracing::error!("gateway server error: {e:#}");
                 std::process::exit(1);
             }

@@ -26,20 +26,28 @@
 
 use std::sync::Arc;
 
+use accelmars_gateway::config::GatewayConfig;
 use accelmars_gateway::registry::AdapterRegistry;
+use accelmars_gateway::router::Router;
 use accelmars_gateway::server::serve_with_listener;
 use accelmars_gateway_core::MockAdapter;
 use tokio::net::TcpListener;
 
-/// Bind port 0, start the server in a background task, return the base URL.
+/// Bind port 0, start the server in mock mode, return the base URL.
 async fn start_test_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+
+    // Use mock mode: all requests routed to MockAdapter, no real providers needed
+    let mut config = GatewayConfig::default();
+    config.mode = accelmars_gateway::config::GatewayMode::Mock;
+
     let mut registry = AdapterRegistry::new();
     registry.register(Arc::new(MockAdapter::default()));
-    let registry = Arc::new(registry);
+
+    let router = Arc::new(Router::new(config, registry));
     tokio::spawn(async move {
-        serve_with_listener(listener, registry).await.ok();
+        serve_with_listener(listener, router).await.ok();
     });
     // Brief yield to let the server task start
     tokio::task::yield_now().await;
