@@ -40,7 +40,7 @@ brew install accelmars/tap/gateway   # macOS (Homebrew)
 gateway serve
 
 # Point your app at it
-export GATEWAY_URL=http://localhost:8080
+export ACCELMARS_GATEWAY_URL=http://localhost:8080
 ```
 
 ---
@@ -90,11 +90,27 @@ Orthogonal to quality tier — express HOW to route:
 
 | Provider | Status | Notes |
 |----------|--------|-------|
-| **Gemini** | Planned | Free tier available |
-| **DeepSeek** | Planned | Very cost-effective |
-| **Claude (Anthropic)** | Planned | Quality-critical work |
-| **OpenAI** | Planned | Optional |
-| **Mock** | Built-in | Tests + CI, deterministic |
+| **Gemini** | ✅ Built | Free tier available (Flash-Lite) |
+| **DeepSeek** | ✅ Built | Very cost-effective (~$0.28/M) |
+| **Claude (Anthropic)** | ✅ Built | Quality-critical work |
+| **OpenRouter** | ✅ Built | Multi-provider proxy |
+| **Groq** | ✅ Built | Low-latency inference |
+| **Mock** | ✅ Built | Tests + CI, deterministic |
+
+---
+
+## CLI Commands
+
+```bash
+gateway serve                        # Start server (default: port 8080)
+gateway serve --port 9000            # Custom port
+gateway status                       # Health + provider availability
+gateway stats                        # Cost summary (all time)
+gateway stats --since 2026-04-01     # Filter by date
+gateway stats --json                 # Machine-readable output
+gateway complete "your prompt"       # One-shot completion (no server needed)
+gateway complete "..." --tier max    # Override quality tier
+```
 
 ---
 

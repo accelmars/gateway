@@ -1,0 +1,74 @@
+name: Bug Report
+description: Report a bug in accelmars-gateway or accelmars-gateway-core
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to file a bug report. Please fill all required fields.
+
+  - type: input
+    id: gateway-version
+    attributes:
+      label: gateway version
+      description: Output of `gateway --version`
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: rust-version
+    attributes:
+      label: Rust version
+      description: Output of `rustc --version`
+      placeholder: "rustc 1.77.0"
+    validations:
+      required: true
+
+  - type: input
+    id: operating-system
+    attributes:
+      label: Operating System
+      placeholder: "macOS 14.4, Ubuntu 22.04"
+    validations:
+      required: true
+
+  - type: input
+    id: provider
+    attributes:
+      label: Provider (if applicable)
+      description: Which provider adapter is involved?
+      placeholder: "gemini, deepseek, claude, openrouter, groq, mock"
+
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal reproducible example preferred. Redact all API keys.
+      placeholder: |
+        1. Run `gateway serve` with config ...
+        2. Send request ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or error output
+      description: Run with `--log-level debug` for more detail. Redact API keys.
+      render: text

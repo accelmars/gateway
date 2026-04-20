@@ -1,0 +1,36 @@
+name: Feature Request
+description: Propose an addition to accelmars/gateway
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests that include a concrete use case and a proposed API are prioritized.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What limitation or missing capability are you hitting?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What would you like to see? Config sketch or API sketch welcome.
+    validations:
+      required: true
+
+  - type: textarea
+    id: provider-use-case
+    attributes:
+      label: Provider or adapter use case
+      description: If this involves a new provider adapter or routing behavior, describe the use case.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds have you tried?
