@@ -13,10 +13,10 @@ body = """
 {% endif -%}
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | striptags | trim | upper_first }}
-{% for commit in commits %}
+{% for commit in commits -%}
 - {% if commit.scope %}(**{{ commit.scope }}**) {% endif %}\
 {% if commit.breaking %}[**BREAKING**] {% endif %}\
-{{ commit.message | upper_first }}\
+{{ commit.message | upper_first | regex_replace(pattern=" \\\\(#\\\\d+\\\\)$", replacement="") }}\
 {% if commit.links %} ([{{ commit.links | map(attribute="text") | join(sep=", ") }}]({{ commit.links | first | get(key="href") }})){% endif %}
 {% endfor %}
 {% endfor %}
@@ -48,11 +48,11 @@ commit_parsers = [
     # Gateway-specific: provider adapter contributions
     { message = "^adapter", group = "<!-- 4 -->Provider Adapters" },
 
-    # Maintenance — shown but lower priority
+    # Maintenance
     { message = "^refactor", group = "<!-- 5 -->Refactor" },
     { message = "^doc", group = "<!-- 6 -->Documentation" },
-    { message = "^test", group = "<!-- 7 -->Testing" },
-    { message = "^chore|^ci|^build", group = "<!-- 8 -->Miscellaneous" },
+    { message = "^test", skip = true },
+    { message = "^chore|^ci|^build", skip = true },
 
     # Noise — skip entirely
     { message = "^style", skip = true },
