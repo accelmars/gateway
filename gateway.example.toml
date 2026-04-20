@@ -1,0 +1,136 @@
+# gateway.example.toml — Documented example configuration
+#
+# Copy this file to gateway.toml and edit as needed.
+# All settings can be overridden via environment variables:
+#   GATEWAY__PORT=9090
+#   GATEWAY__TIERS__STANDARD=claude
+#   GATEWAY__PROVIDERS__DEEPSEEK__API_KEY_ENV=MY_DEEPSEEK_KEY
+#
+# Special env var:
+#   GATEWAY_MODE=mock   — forces all requests to MockAdapter (no AI calls)
+
+# HTTP port for the OpenAI-compatible API server
+port = 8080
+
+# Log level: error | warn | info | debug | trace
+log_level = "info"
+
+# Operating mode: normal | mock
+# "mock" — all requests return deterministic mock responses ($0 cost)
+mode = "normal"
+
+# ---------------------------------------------------------------------------
+# Concurrency
+# ---------------------------------------------------------------------------
+
+[concurrency]
+# Maximum concurrent requests across all providers
+max = 20
+
+# ---------------------------------------------------------------------------
+# Quality tier → provider mapping
+#
+# Values are provider names (keys in [providers.*] below).
+# NOT model IDs — model IDs live in [providers.*] sections.
+#
+# Tier semantics:
+#   quick    — bulk extraction, good enough (~$0 via Gemini free)
+#   standard — production quality, daily work (~$0.28/M via DeepSeek)
+#   max      — important reasoning, quality-critical (~$3/M via Claude Sonnet)
+#   ultra    — absolute best, documented reason required (~$5-30/M)
+# ---------------------------------------------------------------------------
+
+[tiers]
+quick    = "gemini-flash-lite"
+standard = "deepseek"
+max      = "claude"
+ultra    = "claude-opus"
+
+# ---------------------------------------------------------------------------
+# Provider configurations
+#
+# api_key_env: name of the environment variable holding the API key
+# model:       actual model ID sent to this provider (ONLY place model IDs appear)
+# tags:        constraint labels ["free", "fast", "sensitive_ok", "self_hosted"]
+# fallback:    provider name to try when this provider fails
+# ---------------------------------------------------------------------------
+
+[providers.gemini-flash-lite]
+api_key_env        = "GEMINI_API_KEY"
+model              = "gemini-2.5-flash-lite"
+timeout_seconds    = 60
+tags               = ["free", "fast"]
+cost_per_1m_input  = 0.0
+cost_per_1m_output = 0.0
+fallback           = "openrouter"
+
+[providers.gemini-flash]
+api_key_env        = "GEMINI_API_KEY"
+model              = "gemini-2.5-flash"
+timeout_seconds    = 60
+tags               = ["free"]
+cost_per_1m_input  = 0.0
+cost_per_1m_output = 0.0
+fallback           = "openrouter"
+
+[providers.deepseek]
+api_key_env        = "DEEPSEEK_API_KEY"
+model              = "deepseek-chat"
+timeout_seconds    = 120
+tags               = []
+cost_per_1m_input  = 0.28
+cost_per_1m_output = 0.42
+fallback           = "openrouter"
+
+[providers.claude]
+api_key_env        = "ANTHROPIC_API_KEY"
+model              = "claude-sonnet-4-6"
+timeout_seconds    = 120
+tags               = ["sensitive_ok"]
+cost_per_1m_input  = 3.0
+cost_per_1m_output = 15.0
+# no fallback — claude is the quality-critical tier
+
+[providers.claude-opus]
+api_key_env        = "ANTHROPIC_API_KEY"
+model              = "claude-opus-4-6"
+timeout_seconds    = 180
+tags               = ["sensitive_ok"]
+cost_per_1m_input  = 15.0
+cost_per_1m_output = 75.0
+
+[providers.openrouter]
+api_key_env        = "OPENROUTER_API_KEY"
+model              = "deepseek/deepseek-chat-v3-0324:free"
+timeout_seconds    = 120
+tags               = []
+cost_per_1m_input  = 0.0
+cost_per_1m_output = 0.0
+
+[providers.groq]
+api_key_env        = "GROQ_API_KEY"
+model              = "llama-3.3-70b-versatile"
+timeout_seconds    = 30
+tags               = ["fast", "free"]
+cost_per_1m_input  = 0.0
+cost_per_1m_output = 0.0
+
+# ---------------------------------------------------------------------------
+# Constraint rules
+#
+# These lists control how routing constraints filter providers.
+# All routing is config-driven — the router reads these lists, not hardcoded names.
+# ---------------------------------------------------------------------------
+
+[constraints]
+# Providers excluded when privacy=sensitive (data residency concerns)
+sensitive_excluded = ["deepseek"]
+
+# Only these providers allowed when privacy=private (self-hosted only)
+private_only = []
+
+# Providers preferred when latency=low (<1s inference)
+low_latency_preferred = ["groq"]
+
+# Providers available when cost=free (supplements "free" tag filtering)
+free_only = ["gemini-flash-lite", "gemini-flash", "groq"]

@@ -17,6 +17,8 @@ path = "src/main.rs"
 [dependencies]
 accelmars-gateway-core = { path = "../accelmars-gateway-core" }
 anyhow = "1"
+config = { version = "0.14", features = ["toml"] }
+thiserror = "2"
 axum = { version = "0.8", features = ["macros"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"

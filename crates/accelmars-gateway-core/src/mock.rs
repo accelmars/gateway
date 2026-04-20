@@ -13,9 +13,11 @@ use crate::types::{GatewayRequest, GatewayResponse};
 /// # Usage
 /// Set `GATEWAY_MODE=mock` in the server — the server wires `MockAdapter`.
 /// In tests: construct directly, pass to anything accepting `&dyn ProviderAdapter`.
+/// Use `.with_name("provider")` to simulate a named provider in router tests.
 pub struct MockAdapter {
     pub default_response: String,
     pub latency: Option<Duration>,
+    name: String,
 }
 
 impl MockAdapter {
@@ -23,11 +25,18 @@ impl MockAdapter {
         Self {
             default_response: default_response.into(),
             latency: None,
+            name: "mock".to_string(),
         }
     }
 
     pub fn with_latency(mut self, latency: Duration) -> Self {
         self.latency = Some(latency);
+        self
+    }
+
+    /// Override the adapter name (for router tests that need named mock providers).
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
         self
     }
 }
@@ -40,7 +49,7 @@ impl Default for MockAdapter {
 
 impl ProviderAdapter for MockAdapter {
     fn name(&self) -> &str {
-        "mock"
+        &self.name
     }
 
     fn complete(&self, request: &GatewayRequest) -> Result<GatewayResponse, AdapterError> {

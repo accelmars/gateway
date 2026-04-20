@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::Router as AxumRouter;
 use futures_util::stream;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -23,38 +23,35 @@ use crate::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice,
     ErrorDetail, ErrorResponse, StreamChoice, StreamDelta, Usage,
 };
-use crate::registry::AdapterRegistry;
+use crate::router::{RouteDecision, Router};
 
 /// Shared server state — cheaply cloneable (all fields are `Arc`).
 #[derive(Clone)]
 pub struct AppState {
-    pub registry: Arc<AdapterRegistry>,
+    pub router: Arc<Router>,
     pub healthy: Arc<AtomicBool>,
 }
 
 /// Start the gateway on the given port. Blocks until the server shuts down.
-pub async fn serve(port: u16, registry: Arc<AdapterRegistry>) -> anyhow::Result<()> {
+pub async fn serve(port: u16, router: Arc<Router>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
-    serve_with_listener(listener, registry).await
+    serve_with_listener(listener, router).await
 }
 
 /// Start the gateway on an already-bound listener.
 ///
 /// Exposed for integration tests: bind to port 0, get the assigned address, then call this.
-pub async fn serve_with_listener(
-    listener: TcpListener,
-    registry: Arc<AdapterRegistry>,
-) -> anyhow::Result<()> {
+pub async fn serve_with_listener(listener: TcpListener, router: Arc<Router>) -> anyhow::Result<()> {
     let healthy = Arc::new(AtomicBool::new(true));
     let state = AppState {
-        registry,
+        router,
         healthy: healthy.clone(),
     };
 
     let addr = listener.local_addr()?;
     info!("gateway listening on {addr}");
 
-    let app = Router::new()
+    let app = AxumRouter::new()
         .route("/v1/chat/completions", post(handle_completion))
         .route("/health", get(handle_health))
         .with_state(state)
@@ -141,15 +138,13 @@ async fn handle_completion(
     let constraints = parse_constraints(&req);
     let is_stream = req.stream.unwrap_or(false);
 
-    // Resolve adapter from registry (explicit provider override → first available → mock)
-    let adapter = match state.registry.resolve(constraints.provider.as_deref()) {
-        Some(a) => a,
-        None => {
+    // Resolve provider via router (tier + constraints → RouteDecision)
+    let decision = match state.router.resolve(tier, &constraints) {
+        Ok(d) => d,
+        Err(e) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::provider_error(
-                    "no provider adapters available",
-                )),
+                Json(ErrorResponse::provider_error(e.to_string())),
             )
                 .into_response();
         }
@@ -172,9 +167,9 @@ async fn handle_completion(
     };
 
     if is_stream {
-        complete_stream(adapter, tier, gateway_req).await
+        complete_stream(decision, tier, gateway_req, state.router.clone()).await
     } else {
-        complete_json(adapter, tier, gateway_req).await
+        complete_json(decision, tier, gateway_req, state.router.clone()).await
     }
 }
 
@@ -183,19 +178,23 @@ async fn handle_completion(
 // ---------------------------------------------------------------------------
 
 async fn complete_json(
-    adapter: Arc<dyn accelmars_gateway_core::ProviderAdapter>,
+    decision: RouteDecision,
     tier: ModelTier,
     gateway_req: GatewayRequest,
+    router: Arc<Router>,
 ) -> Response {
     let start = Instant::now();
+    let provider_name = decision.provider_name.clone();
+    let adapter = decision.adapter;
 
-    // ProviderAdapter::complete is sync — run on blocking thread pool (ENGINE-LESSONS Rule 2 equivalent)
+    // ProviderAdapter::complete is sync — run on blocking thread pool
     let result = tokio::task::spawn_blocking(move || adapter.complete(&gateway_req)).await;
     let latency_ms = start.elapsed().as_millis();
 
     match result {
         Err(join_err) => {
             error!("adapter task panicked: {join_err}");
+            router.on_failure(&provider_name);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::provider_error("internal error")),
@@ -207,20 +206,24 @@ async fn complete_json(
             error!(
                 error = %adapter_err,
                 tier = %tier,
+                provider = %provider_name,
                 latency_ms,
                 "completion failed"
             );
+            router.on_failure(&provider_name);
             (status, Json(body)).into_response()
         }
         Ok(Ok(resp)) => {
             info!(
                 tier = %tier,
-                provider = %resp.model,
+                provider = %provider_name,
+                model = %resp.model,
                 latency_ms,
                 tokens_in = resp.tokens_in,
                 tokens_out = resp.tokens_out,
                 "completion ok"
             );
+            router.on_success(&provider_name);
             let now = unix_now();
             (
                 StatusCode::OK,
@@ -251,16 +254,19 @@ async fn complete_json(
 
 // ---------------------------------------------------------------------------
 // Streaming path (SSE)
-// Phase 1: MockAdapter only — full response as a single content chunk + DONE sentinel.
+// Phase 1: single content chunk + DONE sentinel.
 // Phase 2+ (real providers): each token becomes a chunk.
 // ---------------------------------------------------------------------------
 
 async fn complete_stream(
-    adapter: Arc<dyn accelmars_gateway_core::ProviderAdapter>,
+    decision: RouteDecision,
     tier: ModelTier,
     gateway_req: GatewayRequest,
+    router: Arc<Router>,
 ) -> Response {
     let start = Instant::now();
+    let provider_name = decision.provider_name.clone();
+    let adapter = decision.adapter;
 
     let result = tokio::task::spawn_blocking(move || adapter.complete(&gateway_req)).await;
     let latency_ms = start.elapsed().as_millis();
@@ -268,6 +274,7 @@ async fn complete_stream(
     match result {
         Err(join_err) => {
             error!("adapter task panicked: {join_err}");
+            router.on_failure(&provider_name);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::provider_error("internal error")),
@@ -275,13 +282,16 @@ async fn complete_stream(
                 .into_response()
         }
         Ok(Err(adapter_err)) => {
+            router.on_failure(&provider_name);
             let (status, body) = adapter_error_to_response(&adapter_err);
             (status, Json(body)).into_response()
         }
         Ok(Ok(resp)) => {
+            router.on_success(&provider_name);
             info!(
                 tier = %tier,
-                provider = %resp.model,
+                provider = %provider_name,
+                model = %resp.model,
                 latency_ms,
                 tokens_in = resp.tokens_in,
                 tokens_out = resp.tokens_out,
