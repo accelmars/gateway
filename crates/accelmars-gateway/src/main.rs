@@ -2,6 +2,10 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
+use accelmars_gateway::adapters::{
+    new_deepseek_adapter, new_groq_adapter, new_openrouter_adapter, ClaudeAdapter, GeminiAdapter,
+};
+use accelmars_gateway::registry::AdapterRegistry;
 use accelmars_gateway::server;
 use accelmars_gateway_core::MockAdapter;
 
@@ -40,6 +44,53 @@ enum Commands {
     },
 }
 
+fn build_registry() -> AdapterRegistry {
+    let mut registry = AdapterRegistry::new();
+    let mode = std::env::var("GATEWAY_MODE").unwrap_or_default();
+
+    // Mock adapter — always registered
+    registry.register(Arc::new(MockAdapter::default()));
+
+    if mode == "mock" {
+        tracing::info!("GATEWAY_MODE=mock — mock adapter only");
+        return registry;
+    }
+
+    // Gemini (free tier) — GEMINI_API_KEY
+    let gemini_key = std::env::var("GEMINI_API_KEY").ok();
+    let gemini_model =
+        std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".to_string());
+    registry.register(Arc::new(GeminiAdapter::new(gemini_key, gemini_model)));
+
+    // DeepSeek — DEEPSEEK_API_KEY
+    let deepseek_key = std::env::var("DEEPSEEK_API_KEY").ok();
+    registry.register(Arc::new(new_deepseek_adapter(deepseek_key)));
+
+    // Claude (Anthropic) — ANTHROPIC_API_KEY
+    let claude_key = std::env::var("ANTHROPIC_API_KEY").ok();
+    let claude_model =
+        std::env::var("CLAUDE_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
+    registry.register(Arc::new(ClaudeAdapter::new(claude_key, claude_model)));
+
+    // OpenRouter — OPENROUTER_API_KEY
+    let openrouter_key = std::env::var("OPENROUTER_API_KEY").ok();
+    registry.register(Arc::new(new_openrouter_adapter(openrouter_key)));
+
+    // Groq — GROQ_API_KEY
+    let groq_key = std::env::var("GROQ_API_KEY").ok();
+    registry.register(Arc::new(new_groq_adapter(groq_key)));
+
+    let available = registry.available();
+    let all = registry.all_providers();
+    tracing::info!(
+        available = ?available,
+        registered = ?all,
+        "adapter registry built"
+    );
+
+    registry
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -51,18 +102,9 @@ async fn main() {
 
     match cli.command {
         Some(Commands::Serve { port }) => {
-            let mode = std::env::var("GATEWAY_MODE").unwrap_or_default();
-            // Phase 1: MockAdapter is the only provider.
-            // Real adapters (Gemini, DeepSeek, Claude) arrive in PF-003.
-            let adapter: Arc<dyn accelmars_gateway_core::ProviderAdapter> = if mode == "mock" {
-                tracing::info!("GATEWAY_MODE=mock — using deterministic mock adapter");
-                Arc::new(MockAdapter::default())
-            } else {
-                tracing::info!("starting in phase-1 mode — mock adapter (real providers: PF-003)");
-                Arc::new(MockAdapter::default())
-            };
+            let registry = Arc::new(build_registry());
 
-            if let Err(e) = server::serve(port, adapter).await {
+            if let Err(e) = server::serve(port, registry).await {
                 tracing::error!("gateway server error: {e:#}");
                 std::process::exit(1);
             }
