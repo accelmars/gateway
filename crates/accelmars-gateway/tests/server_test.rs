@@ -491,3 +491,186 @@ async fn semaphore_queue_timeout_returns_504() {
     // At least one of them should have hit 504 (the timeout is 100ms, mock is blocking)
     // This is timing-sensitive, so we allow both outcomes but verify at least one is valid HTTP
 }
+
+// ---------------------------------------------------------------------------
+// Test 14: Panic inside adapter → semaphore slot recovered
+// (PF-005R Audit 1 — panic safety verification)
+// ---------------------------------------------------------------------------
+
+/// Adapter that panics on every call — used to verify semaphore recovery.
+/// Registered as "mock" so GatewayMode::Mock routes to it.
+struct PanickingAdapter;
+
+impl accelmars_gateway_core::ProviderAdapter for PanickingAdapter {
+    fn name(&self) -> &str {
+        "mock"
+    }
+    fn complete(
+        &self,
+        _request: &accelmars_gateway_core::GatewayRequest,
+    ) -> Result<accelmars_gateway_core::GatewayResponse, accelmars_gateway_core::AdapterError> {
+        panic!("deliberate panic for semaphore recovery test");
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panic_in_adapter_releases_semaphore_permit() {
+    // Setup: server with max=2 concurrency, PanickingAdapter as the only provider.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+
+    let mut config = GatewayConfig::default();
+    config.mode = accelmars_gateway::config::GatewayMode::Mock;
+
+    let mut registry = AdapterRegistry::new();
+    // Register panicking adapter as "mock" so mock-mode routing picks it up
+    registry.register(Arc::new(PanickingAdapter));
+
+    let router = Arc::new(Router::new(config, registry));
+    let limiter = Arc::new(ConcurrencyLimiter::new(2));
+    let limiter_check = Arc::clone(&limiter);
+    let cost_tracker = Arc::new(CostTracker::open(std::path::Path::new(":memory:")).unwrap());
+
+    tokio::spawn(async move {
+        serve_with_listener(listener, router, limiter, cost_tracker, port)
+            .await
+            .ok();
+    });
+    tokio::task::yield_now().await;
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // Send a request that will hit the PanickingAdapter → should get 500 (JoinError)
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "quick",
+            "messages": [{"role": "user", "content": "trigger panic"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        500,
+        "panicked adapter should cause 500 internal server error"
+    );
+
+    // Brief yield for permit drop
+    tokio::task::yield_now().await;
+
+    // Verify: semaphore is back to full capacity (2 available out of 2)
+    assert_eq!(
+        limiter_check.available(),
+        2,
+        "semaphore must recover all permits after panic — got {} available out of {}",
+        limiter_check.available(),
+        limiter_check.max()
+    );
+
+    // Bonus: send a follow-up request to prove the server is still functional
+    // (will also panic → 500, but proves the server isn't hung)
+    let resp2 = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "quick",
+            "messages": [{"role": "user", "content": "after panic"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp2.status(),
+        500,
+        "server must still respond after adapter panic (not hung)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: 20 concurrent requests → all complete, no deadlock, no lost permits
+// (PF-005R Audit 2 — concurrent SQLite write verification)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn twenty_concurrent_requests_all_complete_no_deadlock() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+
+    let mut config = GatewayConfig::default();
+    config.mode = accelmars_gateway::config::GatewayMode::Mock;
+
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MockAdapter::default()));
+
+    let router = Arc::new(Router::new(config, registry));
+    // max=5 so requests queue (20 requests, 5 at a time)
+    let limiter = Arc::new(ConcurrencyLimiter::new(5));
+    let limiter_check = Arc::clone(&limiter);
+    let cost_tracker = Arc::new(CostTracker::open(std::path::Path::new(":memory:")).unwrap());
+    let cost_check = Arc::clone(&cost_tracker);
+
+    tokio::spawn(async move {
+        serve_with_listener(listener, router, limiter, cost_tracker, port)
+            .await
+            .ok();
+    });
+    tokio::task::yield_now().await;
+
+    let base = format!("http://{addr}");
+    let client = Arc::new(reqwest::Client::new());
+
+    // Fire 20 concurrent requests
+    let mut handles = Vec::new();
+    for i in 0..20 {
+        let base = base.clone();
+        let client = Arc::clone(&client);
+        handles.push(tokio::spawn(async move {
+            client
+                .post(format!("{base}/v1/chat/completions"))
+                .json(&serde_json::json!({
+                    "model": "quick",
+                    "messages": [{"role": "user", "content": format!("concurrent request {i}")}]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }));
+    }
+
+    // All 20 must complete (no deadlock, no hang)
+    let mut success_count = 0;
+    for handle in handles {
+        let status = handle.await.unwrap();
+        assert_eq!(status, 200, "all concurrent requests should succeed");
+        success_count += 1;
+    }
+    assert_eq!(success_count, 20, "all 20 requests must complete");
+
+    // Brief yield for final permit drops
+    tokio::task::yield_now().await;
+
+    // Verify semaphore fully recovered
+    assert_eq!(
+        limiter_check.available(),
+        limiter_check.max(),
+        "all semaphore permits must be returned after concurrent batch"
+    );
+
+    // Verify SQLite recorded all 20 requests (no missing, no duplicates)
+    let summary = cost_check.summary(None).unwrap();
+    assert_eq!(
+        summary.total_calls, 20,
+        "cost tracker must record exactly 20 entries — got {}",
+        summary.total_calls
+    );
+}
