@@ -5,11 +5,14 @@ use clap::{Parser, Subcommand};
 use accelmars_gateway::adapters::{
     new_deepseek_adapter, new_groq_adapter, new_openrouter_adapter, ClaudeAdapter, GeminiAdapter,
 };
+use accelmars_gateway::cli;
+use accelmars_gateway::concurrency::ConcurrencyLimiter;
 use accelmars_gateway::config::GatewayConfig;
+use accelmars_gateway::cost::CostTracker;
 use accelmars_gateway::registry::AdapterRegistry;
 use accelmars_gateway::router::Router;
 use accelmars_gateway::server;
-use accelmars_gateway_core::MockAdapter;
+use accelmars_gateway_core::{MockAdapter, ModelTier};
 
 #[derive(Parser)]
 #[command(
@@ -39,13 +42,42 @@ enum Commands {
         config: Option<std::path::PathBuf>,
     },
     /// Show gateway health and provider availability
-    Status,
+    Status {
+        /// Port the server is listening on (default: read from config)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Path to config file (to read port default)
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+    },
     /// Show cost summary and call statistics
-    Stats,
-    /// Execute a single completion (one-shot mode)
+    Stats {
+        /// Filter to calls on or after this date (YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+        /// Filter by provider name
+        #[arg(long)]
+        provider: Option<String>,
+        /// Filter by tier (quick, standard, max, ultra)
+        #[arg(long)]
+        tier: Option<String>,
+    },
+    /// Execute a single completion (one-shot mode, no server needed)
     Complete {
         /// Prompt to complete
         prompt: String,
+        /// Model tier to use (quick, standard, max, ultra)
+        #[arg(short, long, default_value = "standard")]
+        tier: String,
+        /// Output JSON with full metadata
+        #[arg(long)]
+        json: bool,
+        /// Path to config file (default: gateway.toml in CWD)
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
     },
 }
 
@@ -62,7 +94,6 @@ fn build_registry_from_config(config: &GatewayConfig) -> AdapterRegistry {
         return registry;
     }
 
-    // Register adapters for each configured provider
     for (name, provider_cfg) in &config.providers {
         let api_key = std::env::var(&provider_cfg.api_key_env).ok();
         let adapter: Arc<dyn accelmars_gateway_core::ProviderAdapter> = match name.as_str() {
@@ -114,12 +145,10 @@ async fn main() {
                 }
             };
 
-            // CLI --port overrides config file
             if let Some(p) = port {
                 gateway_config.port = p;
             }
 
-            // Validate config (warnings logged; only fatal if zero providers)
             match gateway_config.validate() {
                 Ok(warnings) => {
                     for w in &warnings {
@@ -133,23 +162,87 @@ async fn main() {
             }
 
             let serve_port = gateway_config.port;
+            let max_concurrent = gateway_config.concurrency.max as usize;
             let registry = build_registry_from_config(&gateway_config);
             let router = Arc::new(Router::new(gateway_config, registry));
+            let limiter = Arc::new(ConcurrencyLimiter::new(max_concurrent));
 
-            if let Err(e) = server::serve(serve_port, router).await {
+            let db_path = CostTracker::default_path();
+            let cost_tracker = match CostTracker::open(&db_path) {
+                Ok(t) => Arc::new(t),
+                Err(e) => {
+                    tracing::warn!("cost tracker unavailable (fail-open): {e:#}");
+                    // Create an in-memory fallback so the server still starts
+                    match CostTracker::open(std::path::Path::new(":memory:")) {
+                        Ok(t) => Arc::new(t),
+                        Err(e2) => {
+                            tracing::error!("cost tracker fallback also failed: {e2:#}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            };
+
+            if let Err(e) = server::serve(serve_port, router, limiter, cost_tracker).await {
                 tracing::error!("gateway server error: {e:#}");
                 std::process::exit(1);
             }
         }
-        Some(Commands::Status) => {
-            eprintln!("gateway status: not yet implemented — coming in PF-005");
+
+        Some(Commands::Status { port, config }) => {
+            let config_path = config.as_deref();
+            let gateway_config = GatewayConfig::load(config_path).unwrap_or_default();
+            let resolved_port = port.unwrap_or(gateway_config.port);
+
+            if let Err(e) = cli::status::run(resolved_port).await {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
         }
-        Some(Commands::Stats) => {
-            eprintln!("gateway stats: not yet implemented — coming in PF-005");
+
+        Some(Commands::Stats {
+            since,
+            json,
+            provider,
+            tier,
+        }) => {
+            if let Err(e) =
+                cli::stats::run(since.as_deref(), json, provider.as_deref(), tier.as_deref())
+            {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
         }
-        Some(Commands::Complete { prompt }) => {
-            eprintln!("gateway complete '{prompt}': not yet implemented — coming in PF-005");
+
+        Some(Commands::Complete {
+            prompt,
+            tier,
+            json,
+            config,
+        }) => {
+            let config_path = config.as_deref();
+            let gateway_config = match GatewayConfig::load(config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e:#}");
+                    std::process::exit(1);
+                }
+            };
+
+            let model_tier = match tier.parse::<ModelTier>() {
+                Ok(t) => t,
+                Err(_) => {
+                    eprintln!("unknown tier '{}' — use: quick, standard, max, ultra", tier);
+                    std::process::exit(1);
+                }
+            };
+
+            if let Err(e) = cli::complete::run(&gateway_config, model_tier, &prompt, json).await {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
         }
+
         None => {
             eprintln!("AccelMars Gateway v{}", env!("CARGO_PKG_VERSION"));
             eprintln!("Run `gateway --help` for usage.");

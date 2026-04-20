@@ -322,6 +322,60 @@ impl Router {
     }
 }
 
+/// Provider availability info for the /status endpoint.
+#[derive(Debug, serde::Serialize)]
+pub struct ProviderStatusInfo {
+    pub name: String,
+    pub available: bool,
+    pub tags: Vec<String>,
+}
+
+impl Router {
+    /// Gateway operating mode (for /status).
+    pub fn mode(&self) -> crate::config::GatewayMode {
+        self.config.mode
+    }
+
+    /// Returns (cost_per_1m_input, cost_per_1m_output) for a provider.
+    /// Returns (0.0, 0.0) if provider not found.
+    pub fn provider_pricing(&self, provider_name: &str) -> (f64, f64) {
+        self.config
+            .providers
+            .get(provider_name)
+            .map(|p| (p.cost_per_1m_input, p.cost_per_1m_output))
+            .unwrap_or((0.0, 0.0))
+    }
+
+    /// List all registered providers with availability and tags (for /status).
+    pub fn provider_statuses(&self) -> Vec<ProviderStatusInfo> {
+        let mut statuses: Vec<ProviderStatusInfo> = self
+            .registry
+            .all_providers()
+            .into_iter()
+            .map(|name| {
+                let available = self
+                    .registry
+                    .get(name)
+                    .map(|a| a.is_available())
+                    .unwrap_or(false);
+                let tags = self
+                    .config
+                    .providers
+                    .get(name)
+                    .map(|p| p.tags.clone())
+                    .unwrap_or_default();
+                ProviderStatusInfo {
+                    name: name.to_string(),
+                    available,
+                    tags,
+                }
+            })
+            .collect();
+        statuses.sort_by(|a, b| a.name.cmp(&b.name));
+        statuses
+    }
+}
+
 /// Errors from the router.
 #[derive(Debug, thiserror::Error)]
 pub enum RouterError {
