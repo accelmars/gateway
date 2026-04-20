@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
-- Close PF-004 DONE A — config + routing (4 tiers, constraints, health tracking, fallback chains) (#10) ([#10](https://github.com/accelmars/gateway/pull/10))
+- Add `RoutingConstraints`, `ProviderConstraints`, and `RoutingConfig` types for config-driven provider selection across four quality tiers ([#10](https://github.com/accelmars/gateway/pull/10))
 
 ## [0.1.0] - 2026-04-19
 
