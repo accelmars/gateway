@@ -16,25 +16,26 @@ use tracing::{error, info};
 
 use accelmars_gateway_core::{
     AdapterError, Capability, CostPreference, GatewayRequest, Latency, Message, ModelTier, Privacy,
-    ProviderAdapter, RoutingConstraints,
+    RoutingConstraints,
 };
 
 use crate::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice,
     ErrorDetail, ErrorResponse, StreamChoice, StreamDelta, Usage,
 };
+use crate::registry::AdapterRegistry;
 
 /// Shared server state — cheaply cloneable (all fields are `Arc`).
 #[derive(Clone)]
 pub struct AppState {
-    pub adapter: Arc<dyn ProviderAdapter>,
+    pub registry: Arc<AdapterRegistry>,
     pub healthy: Arc<AtomicBool>,
 }
 
 /// Start the gateway on the given port. Blocks until the server shuts down.
-pub async fn serve(port: u16, adapter: Arc<dyn ProviderAdapter>) -> anyhow::Result<()> {
+pub async fn serve(port: u16, registry: Arc<AdapterRegistry>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
-    serve_with_listener(listener, adapter).await
+    serve_with_listener(listener, registry).await
 }
 
 /// Start the gateway on an already-bound listener.
@@ -42,11 +43,11 @@ pub async fn serve(port: u16, adapter: Arc<dyn ProviderAdapter>) -> anyhow::Resu
 /// Exposed for integration tests: bind to port 0, get the assigned address, then call this.
 pub async fn serve_with_listener(
     listener: TcpListener,
-    adapter: Arc<dyn ProviderAdapter>,
+    registry: Arc<AdapterRegistry>,
 ) -> anyhow::Result<()> {
     let healthy = Arc::new(AtomicBool::new(true));
     let state = AppState {
-        adapter,
+        registry,
         healthy: healthy.clone(),
     };
 
@@ -140,6 +141,20 @@ async fn handle_completion(
     let constraints = parse_constraints(&req);
     let is_stream = req.stream.unwrap_or(false);
 
+    // Resolve adapter from registry (explicit provider override → first available → mock)
+    let adapter = match state.registry.resolve(constraints.provider.as_deref()) {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse::provider_error(
+                    "no provider adapters available",
+                )),
+            )
+                .into_response();
+        }
+    };
+
     let gateway_req = GatewayRequest {
         tier,
         constraints,
@@ -157,9 +172,9 @@ async fn handle_completion(
     };
 
     if is_stream {
-        complete_stream(state, tier, gateway_req).await
+        complete_stream(adapter, tier, gateway_req).await
     } else {
-        complete_json(state, tier, gateway_req).await
+        complete_json(adapter, tier, gateway_req).await
     }
 }
 
@@ -167,9 +182,12 @@ async fn handle_completion(
 // Non-streaming path
 // ---------------------------------------------------------------------------
 
-async fn complete_json(state: AppState, tier: ModelTier, gateway_req: GatewayRequest) -> Response {
+async fn complete_json(
+    adapter: Arc<dyn accelmars_gateway_core::ProviderAdapter>,
+    tier: ModelTier,
+    gateway_req: GatewayRequest,
+) -> Response {
     let start = Instant::now();
-    let adapter = state.adapter.clone();
 
     // ProviderAdapter::complete is sync — run on blocking thread pool (ENGINE-LESSONS Rule 2 equivalent)
     let result = tokio::task::spawn_blocking(move || adapter.complete(&gateway_req)).await;
@@ -238,12 +256,11 @@ async fn complete_json(state: AppState, tier: ModelTier, gateway_req: GatewayReq
 // ---------------------------------------------------------------------------
 
 async fn complete_stream(
-    state: AppState,
+    adapter: Arc<dyn accelmars_gateway_core::ProviderAdapter>,
     tier: ModelTier,
     gateway_req: GatewayRequest,
 ) -> Response {
     let start = Instant::now();
-    let adapter = state.adapter.clone();
 
     let result = tokio::task::spawn_blocking(move || adapter.complete(&gateway_req)).await;
     let latency_ms = start.elapsed().as_millis();

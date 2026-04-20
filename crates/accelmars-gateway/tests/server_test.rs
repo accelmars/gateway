@@ -26,6 +26,7 @@
 
 use std::sync::Arc;
 
+use accelmars_gateway::registry::AdapterRegistry;
 use accelmars_gateway::server::serve_with_listener;
 use accelmars_gateway_core::MockAdapter;
 use tokio::net::TcpListener;
@@ -34,9 +35,11 @@ use tokio::net::TcpListener;
 async fn start_test_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let adapter = Arc::new(MockAdapter::default());
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MockAdapter::default()));
+    let registry = Arc::new(registry);
     tokio::spawn(async move {
-        serve_with_listener(listener, adapter).await.ok();
+        serve_with_listener(listener, registry).await.ok();
     });
     // Brief yield to let the server task start
     tokio::task::yield_now().await;
