@@ -27,6 +27,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use accelmars_gateway::auth::AuthStore;
 use accelmars_gateway::concurrency::ConcurrencyLimiter;
 use accelmars_gateway::config::GatewayConfig;
 use accelmars_gateway::cost::CostTracker;
@@ -36,7 +37,7 @@ use accelmars_gateway::server::serve_with_listener;
 use accelmars_gateway_core::MockAdapter;
 use tokio::net::TcpListener;
 
-/// Bind port 0, start the server in mock mode, return the base URL.
+/// Bind port 0, start the server in mock mode with auth disabled, return the base URL.
 async fn start_test_server() -> String {
     start_test_server_with_max_concurrent(20).await
 }
@@ -55,16 +56,65 @@ async fn start_test_server_with_max_concurrent(max: usize) -> String {
     let router = Arc::new(Router::new(config, registry));
     let limiter = Arc::new(ConcurrencyLimiter::new(max));
 
-    // In-memory cost tracker for tests (no disk writes)
+    // In-memory cost tracker and auth store for tests (no disk writes)
     let cost_tracker = Arc::new(CostTracker::open(std::path::Path::new(":memory:")).unwrap());
+    let auth_store = Arc::new(AuthStore::in_memory().unwrap());
 
     tokio::spawn(async move {
-        serve_with_listener(listener, router, limiter, cost_tracker, port)
-            .await
-            .ok();
+        // auth_disabled: true — existing tests don't use API keys
+        serve_with_listener(
+            listener,
+            router,
+            limiter,
+            cost_tracker,
+            auth_store,
+            true,
+            port,
+        )
+        .await
+        .ok();
     });
     tokio::task::yield_now().await;
     format!("http://{addr}")
+}
+
+/// Start a server with auth ENABLED. Returns (base_url, api_key, auth_store).
+async fn start_auth_test_server() -> (String, String, Arc<AuthStore>) {
+    let auth_store = Arc::new(AuthStore::in_memory().unwrap());
+    let (test_key, _) = auth_store.create_key("test").unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+
+    let mut config = GatewayConfig::default();
+    config.mode = accelmars_gateway::config::GatewayMode::Mock;
+
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MockAdapter::default()));
+
+    let router = Arc::new(Router::new(config, registry));
+    let limiter = Arc::new(ConcurrencyLimiter::new(20));
+    let cost_tracker = Arc::new(CostTracker::open(std::path::Path::new(":memory:")).unwrap());
+    let auth_store_for_server = Arc::clone(&auth_store);
+
+    tokio::spawn(async move {
+        // auth_disabled: false — auth middleware is active
+        serve_with_listener(
+            listener,
+            router,
+            limiter,
+            cost_tracker,
+            auth_store_for_server,
+            false,
+            port,
+        )
+        .await
+        .ok();
+    });
+    tokio::task::yield_now().await;
+
+    (format!("http://{addr}"), test_key, auth_store)
 }
 
 // ---------------------------------------------------------------------------
@@ -428,11 +478,20 @@ async fn semaphore_queue_timeout_returns_504() {
         Duration::from_millis(100),
     ));
     let cost_tracker = Arc::new(CostTracker::open(std::path::Path::new(":memory:")).unwrap());
+    let auth_store = Arc::new(AuthStore::in_memory().unwrap());
 
     tokio::spawn(async move {
-        serve_with_listener(listener, router, limiter, cost_tracker, port)
-            .await
-            .ok();
+        serve_with_listener(
+            listener,
+            router,
+            limiter,
+            cost_tracker,
+            auth_store,
+            true,
+            port,
+        )
+        .await
+        .ok();
     });
     tokio::task::yield_now().await;
 
@@ -534,11 +593,20 @@ async fn panic_in_adapter_releases_semaphore_permit() {
     let limiter = Arc::new(ConcurrencyLimiter::new(2));
     let limiter_check = Arc::clone(&limiter);
     let cost_tracker = Arc::new(CostTracker::open(std::path::Path::new(":memory:")).unwrap());
+    let auth_store = Arc::new(AuthStore::in_memory().unwrap());
 
     tokio::spawn(async move {
-        serve_with_listener(listener, router, limiter, cost_tracker, port)
-            .await
-            .ok();
+        serve_with_listener(
+            listener,
+            router,
+            limiter,
+            cost_tracker,
+            auth_store,
+            true,
+            port,
+        )
+        .await
+        .ok();
     });
     tokio::task::yield_now().await;
 
@@ -616,11 +684,20 @@ async fn twenty_concurrent_requests_all_complete_no_deadlock() {
     let limiter_check = Arc::clone(&limiter);
     let cost_tracker = Arc::new(CostTracker::open(std::path::Path::new(":memory:")).unwrap());
     let cost_check = Arc::clone(&cost_tracker);
+    let auth_store = Arc::new(AuthStore::in_memory().unwrap());
 
     tokio::spawn(async move {
-        serve_with_listener(listener, router, limiter, cost_tracker, port)
-            .await
-            .ok();
+        serve_with_listener(
+            listener,
+            router,
+            limiter,
+            cost_tracker,
+            auth_store,
+            true,
+            port,
+        )
+        .await
+        .ok();
     });
     tokio::task::yield_now().await;
 
@@ -741,5 +818,129 @@ async fn status_cli_json_mode_returns_running_true() {
     assert_eq!(
         exit_code, 0,
         "exit 0 expected in JSON mode when server is running"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Auth middleware tests (EC-5 through EC-9)
+// ---------------------------------------------------------------------------
+
+// Test 19 (EC-5): Valid Bearer key → 200
+#[tokio::test]
+async fn auth_valid_key_returns_200() {
+    let (base, key, _store) = start_auth_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .json(&serde_json::json!({
+            "model": "quick",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200, "valid Bearer key should return 200");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
+}
+
+// Test 20 (EC-6): Missing Authorization header → 401 with OpenAI error format
+#[tokio::test]
+async fn auth_missing_key_returns_401_with_openai_format() {
+    let (base, _, _store) = start_auth_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "quick",
+            "messages": [{"role": "user", "content": "no auth header"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401, "missing auth header should return 401");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["error"]["type"], "auth_error",
+        "error type should be auth_error"
+    );
+    assert_eq!(
+        body["error"]["code"], "invalid_api_key",
+        "error code should be invalid_api_key"
+    );
+    assert!(
+        body["error"]["message"].as_str().is_some(),
+        "error message should be present"
+    );
+}
+
+// Test 21 (EC-7): Wrong key → 401
+#[tokio::test]
+async fn auth_invalid_key_returns_401() {
+    let (base, _, _store) = start_auth_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header(
+            "Authorization",
+            "Bearer gw_live_thisisnotavalidkeyAAAAAAAAAAAAAAAAAAAA",
+        )
+        .json(&serde_json::json!({
+            "model": "quick",
+            "messages": [{"role": "user", "content": "wrong key"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401, "invalid key should return 401");
+}
+
+// Test 22 (EC-8): GET /health without auth header → 200 (exempt from auth)
+#[tokio::test]
+async fn auth_health_endpoint_exempt_from_auth() {
+    let (base, _, _store) = start_auth_test_server().await;
+    let client = reqwest::Client::new();
+
+    // No Authorization header
+    let resp = client.get(format!("{base}/health")).send().await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "/health must be reachable without an API key"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+}
+
+// Test 23 (EC-9): auth_disabled server → 200 without key
+#[tokio::test]
+async fn auth_disabled_allows_requests_without_key() {
+    // start_test_server() uses auth_disabled: true — verifies the escape hatch works.
+    let base = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // No Authorization header
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "quick",
+            "messages": [{"role": "user", "content": "no key needed when auth disabled"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "auth_disabled server must accept requests without a key"
     );
 }

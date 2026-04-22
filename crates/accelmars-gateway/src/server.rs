@@ -19,6 +19,7 @@ use accelmars_gateway_core::{
     RoutingConstraints,
 };
 
+use crate::auth::AuthStore;
 use crate::concurrency::ConcurrencyLimiter;
 use crate::cost::{CostTracker, RequestRecord};
 use crate::openai::{
@@ -33,6 +34,10 @@ pub struct AppState {
     pub router: Arc<Router>,
     pub limiter: Arc<ConcurrencyLimiter>,
     pub cost_tracker: Arc<CostTracker>,
+    pub auth: Arc<AuthStore>,
+    /// When true, all requests are allowed without an API key.
+    /// Set from `GATEWAY_AUTH_DISABLED` env var at startup. Never check per-request env var.
+    pub auth_disabled: bool,
     pub healthy: Arc<AtomicBool>,
     pub start_time: Instant,
     pub port: u16,
@@ -44,9 +49,20 @@ pub async fn serve(
     router: Arc<Router>,
     limiter: Arc<ConcurrencyLimiter>,
     cost_tracker: Arc<CostTracker>,
+    auth_store: Arc<AuthStore>,
+    auth_disabled: bool,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
-    serve_with_listener(listener, router, limiter, cost_tracker, port).await
+    serve_with_listener(
+        listener,
+        router,
+        limiter,
+        cost_tracker,
+        auth_store,
+        auth_disabled,
+        port,
+    )
+    .await
 }
 
 /// Start the gateway on an already-bound listener.
@@ -57,6 +73,8 @@ pub async fn serve_with_listener(
     router: Arc<Router>,
     limiter: Arc<ConcurrencyLimiter>,
     cost_tracker: Arc<CostTracker>,
+    auth_store: Arc<AuthStore>,
+    auth_disabled: bool,
     port: u16,
 ) -> anyhow::Result<()> {
     let healthy = Arc::new(AtomicBool::new(true));
@@ -64,6 +82,8 @@ pub async fn serve_with_listener(
         router,
         limiter,
         cost_tracker,
+        auth: auth_store,
+        auth_disabled,
         healthy: healthy.clone(),
         start_time: Instant::now(),
         port,
@@ -76,6 +96,10 @@ pub async fn serve_with_listener(
         .route("/v1/chat/completions", post(handle_completion))
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
@@ -113,6 +137,63 @@ async fn shutdown_signal(healthy: Arc<AtomicBool>) {
 
     healthy.store(false, Ordering::SeqCst);
     info!("shutdown signal received — draining in-flight requests");
+}
+
+// ---------------------------------------------------------------------------
+// Auth middleware
+// ---------------------------------------------------------------------------
+
+/// Validates `Authorization: Bearer <key>` on all routes except `/health` and `/status`.
+///
+/// On success, inserts the API key's record ID as a `String` extension so
+/// `handle_completion` can attribute cost records to the specific key.
+///
+/// Fail-open: if the auth DB is unavailable, a warning is logged and the request
+/// proceeds. Consistent with the cost tracker's fail-open philosophy.
+async fn auth_middleware(
+    State(state): State<AppState>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+
+    // Health and status endpoints are always exempt — load balancers and CLI use these.
+    if path == "/health" || path == "/status" {
+        return next.run(request).await;
+    }
+
+    // Auth globally disabled (local dev / mock mode) — skip validation.
+    if state.auth_disabled {
+        return next.run(request).await;
+    }
+
+    // Extract Bearer token from Authorization header.
+    let key = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_owned);
+
+    match key {
+        None => ErrorResponse::auth_error(
+            "Missing API key. Include Authorization: Bearer <key> header.",
+        )
+        .into_response(),
+        Some(key) => match state.auth.validate_key(&key) {
+            Ok(Some(record)) => {
+                // Attach key ID to request extensions for cost attribution.
+                request.extensions_mut().insert(record.id.clone());
+                next.run(request).await
+            }
+            Ok(None) => ErrorResponse::auth_error("Invalid or revoked API key.").into_response(),
+            Err(_) => {
+                // Auth DB error — fail-open so a broken auth DB doesn't take down production.
+                tracing::warn!("auth store error — allowing request (fail-open)");
+                next.run(request).await
+            }
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -155,8 +236,11 @@ async fn handle_status(State(state): State<AppState>) -> Response {
 
 async fn handle_completion(
     State(state): State<AppState>,
+    key_id: Option<axum::extract::Extension<String>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
+    let key_id = key_id.map(|ext| ext.0);
+
     // Validate messages present
     if req.messages.is_empty() {
         return (
@@ -229,10 +313,10 @@ async fn handle_completion(
     };
 
     if is_stream {
-        complete_stream(state, decision, tier, gateway_req).await
+        complete_stream(state, decision, tier, gateway_req, key_id).await
         // _permit dropped here — slot released after streaming completes
     } else {
-        complete_json(state, decision, tier, gateway_req).await
+        complete_json(state, decision, tier, gateway_req, key_id).await
         // _permit dropped here — slot released after JSON response returned
     }
 }
@@ -246,6 +330,7 @@ async fn complete_json(
     decision: RouteDecision,
     tier: ModelTier,
     gateway_req: GatewayRequest,
+    key_id: Option<String>,
 ) -> Response {
     let start = Instant::now();
     let provider_name = decision.provider_name.clone();
@@ -271,6 +356,7 @@ async fn complete_json(
                 status: "error".to_string(),
                 error_type: Some("internal_error".to_string()),
                 constraints: None,
+                key_id,
             });
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -301,6 +387,7 @@ async fn complete_json(
                 status: "error".to_string(),
                 error_type: Some(adapter_error_type(&adapter_err).to_string()),
                 constraints: None,
+                key_id,
             });
             (status, Json(body)).into_response()
         }
@@ -337,6 +424,7 @@ async fn complete_json(
                 status: "ok".to_string(),
                 error_type: None,
                 constraints: None,
+                key_id,
             });
 
             let now = unix_now();
@@ -378,6 +466,7 @@ async fn complete_stream(
     decision: RouteDecision,
     tier: ModelTier,
     gateway_req: GatewayRequest,
+    key_id: Option<String>,
 ) -> Response {
     let start = Instant::now();
     let provider_name = decision.provider_name.clone();
@@ -434,6 +523,7 @@ async fn complete_stream(
                 status: "ok".to_string(),
                 error_type: None,
                 constraints: None,
+                key_id,
             });
 
             let now = unix_now();

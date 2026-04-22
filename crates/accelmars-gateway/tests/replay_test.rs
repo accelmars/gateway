@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use accelmars_gateway::adapters::fixture::FixtureAdapter;
+use accelmars_gateway::auth::AuthStore;
 use accelmars_gateway::concurrency::ConcurrencyLimiter;
 use accelmars_gateway::config::{GatewayConfig, GatewayMode};
 use accelmars_gateway::cost::CostTracker;
@@ -51,9 +52,10 @@ async fn start_replay_server(fixture_name: &str) -> String {
     let router = Arc::new(Router::new(config, registry));
     let limiter = Arc::new(ConcurrencyLimiter::new(20));
     let cost_tracker = Arc::new(CostTracker::open(std::path::Path::new(":memory:")).unwrap());
+    let auth_store = Arc::new(AuthStore::in_memory().unwrap());
 
     tokio::spawn(async move {
-        serve_with_listener(listener, router, limiter, cost_tracker, port)
+        serve_with_listener(listener, router, limiter, cost_tracker, auth_store, true, port)
             .await
             .ok();
     });

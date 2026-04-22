@@ -94,6 +94,20 @@ impl ErrorResponse {
             },
         }
     }
+
+    /// 401 response for missing or invalid API keys — matches OpenAI's auth error format.
+    pub fn auth_error(message: &str) -> (axum::http::StatusCode, axum::Json<Self>) {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::Json(Self {
+                error: ErrorDetail {
+                    message: message.to_string(),
+                    error_type: "auth_error".to_string(),
+                    code: "invalid_api_key".to_string(),
+                },
+            }),
+        )
+    }
 }
 
 /// SSE chunk for streaming responses (`stream: true`).
