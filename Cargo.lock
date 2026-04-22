@@ -12,6 +12,7 @@ dependencies = [
  "clap",
  "config",
  "futures-util",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",

@@ -39,7 +39,29 @@ pub fn run(
         .filter(|t| tier_filter.is_none_or(|f| t.tier == f))
         .collect();
 
+    // Determine if filters were applied and produced empty results
+    let filters_applied = provider_filter.is_some() || tier_filter.is_some();
+    let no_matching_records =
+        filters_applied && by_provider.is_empty() && by_tier.is_empty() && summary.total_calls > 0;
+
     if json_output {
+        if no_matching_records {
+            let mut filters = serde_json::Map::new();
+            if let Some(p) = provider_filter {
+                filters.insert("provider".to_string(), serde_json::json!(p));
+            }
+            if let Some(t) = tier_filter {
+                filters.insert("tier".to_string(), serde_json::json!(t));
+            }
+            let obj = serde_json::json!({
+                "total_calls": 0,
+                "filters_applied": filters,
+                "note": "no matching records"
+            });
+            println!("{}", serde_json::to_string_pretty(&obj)?);
+            return Ok(());
+        }
+
         let obj = serde_json::json!({
             "period": since.unwrap_or("all-time"),
             "total_calls": summary.total_calls,
@@ -62,12 +84,23 @@ pub fn run(
     // Human-readable output
     println!("AccelMars Gateway — Usage Summary");
     println!();
+
+    if no_matching_records {
+        let filter_desc = match (provider_filter, tier_filter) {
+            (Some(p), Some(t)) => format!("provider={p}, tier={t}"),
+            (Some(p), None) => format!("provider={p}"),
+            (None, Some(t)) => format!("tier={t}"),
+            (None, None) => unreachable!(),
+        };
+        println!("No matching records. (filters: {filter_desc})");
+        return Ok(());
+    }
+
     let period = since.unwrap_or("all-time");
     println!("Period: {period}");
     println!();
     println!("  Total calls:  {}", summary.total_calls);
     println!("  Total cost:   ${:.4}", summary.total_cost_usd);
-    println!("  Cache hit rate: 0% (no cache yet)");
     println!();
 
     if !by_provider.is_empty() {
@@ -99,4 +132,30 @@ pub fn run(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — stats output
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run stats with a nonexistent filter against an empty DB path (no DB file).
+    /// Expected: no output, no panic.
+    #[test]
+    fn stats_with_no_db_returns_ok() {
+        // Temporarily point to a nonexistent DB path
+        std::env::set_var(
+            "GATEWAY_DB_PATH",
+            "/tmp/.test-gateway-stats-nonexistent-99999.db",
+        );
+        let result = run(None, false, None, None);
+        std::env::remove_var("GATEWAY_DB_PATH");
+        assert!(
+            result.is_ok(),
+            "stats with no DB should return Ok: {result:?}"
+        );
+    }
 }

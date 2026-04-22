@@ -1,24 +1,82 @@
-/// `gateway status` — query the running server and print a human-readable summary.
-pub async fn run(port: u16) -> anyhow::Result<()> {
+/// Describes how the port was resolved — included in both human and JSON output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortSource {
+    Flag,
+    PidFile,
+    Config,
+    Default,
+}
+
+impl PortSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PortSource::Flag => "flag",
+            PortSource::PidFile => "pid_file",
+            PortSource::Config => "config",
+            PortSource::Default => "default",
+        }
+    }
+}
+
+/// `gateway status` — query the running server and print a summary.
+///
+/// # Exit codes (returned as `Ok(i32)`)
+/// - `0` — server is running and healthy (HTTP 200 from /status)
+/// - `1` — server is not running, or returned non-200
+/// - `Err(_)` — system error (network failure, DNS resolution failure) → caller exits 2
+pub async fn run(port: u16, source: PortSource, json_output: bool) -> anyhow::Result<i32> {
     let url = format!("http://127.0.0.1:{port}/status");
 
     let resp = match reqwest::get(&url).await {
         Ok(r) => r,
-        Err(_) => {
-            println!("AccelMars Gateway");
-            println!();
-            println!("Server:      not running (nothing listening on port {port})");
-            println!("Tip: start with `gateway serve`");
-            return Ok(());
+        Err(e) => {
+            // Connection-refused is the normal "server not running" case → exit 1.
+            // Other errors (DNS, timeout, etc.) are system errors → exit 2 (via Err).
+            if e.is_connect() || e.is_request() {
+                emit_not_running(port, source, json_output)?;
+                return Ok(1);
+            }
+            return Err(anyhow::anyhow!("network error checking port {port}: {e:#}"));
         }
     };
 
     if !resp.status().is_success() {
-        anyhow::bail!("server returned HTTP {}", resp.status());
+        if json_output {
+            let obj = serde_json::json!({
+                "running": false,
+                "checked_port": port,
+                "http_status": resp.status().as_u16(),
+                "source": source.as_str()
+            });
+            println!("{}", serde_json::to_string_pretty(&obj)?);
+        } else {
+            println!("AccelMars Gateway");
+            println!();
+            println!(
+                "Server:      unhealthy (port {port}, HTTP {})",
+                resp.status().as_u16()
+            );
+        }
+        return Ok(1);
     }
 
     let data: serde_json::Value = resp.json().await?;
 
+    if json_output {
+        let obj = serde_json::json!({
+            "running": true,
+            "version": data["version"].as_str().unwrap_or("unknown"),
+            "port": data["port"].as_u64().unwrap_or(port as u64),
+            "uptime_seconds": data["uptime_seconds"].as_u64().unwrap_or(0),
+            "mode": data["mode"].as_str().unwrap_or("unknown"),
+            "concurrency": data["concurrency"],
+            "providers": data["providers"]
+        });
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+        return Ok(0);
+    }
+
+    // Human-readable output
     let version = data["version"].as_str().unwrap_or("unknown");
     let port_val = data["port"].as_u64().unwrap_or(port as u64);
     let mode = data["mode"].as_str().unwrap_or("unknown");
@@ -26,11 +84,12 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
     let active = data["concurrency"]["active"].as_u64().unwrap_or(0);
     let max = data["concurrency"]["max"].as_u64().unwrap_or(0);
 
-    let uptime_str = format_uptime(uptime);
-
     println!("AccelMars Gateway v{version}");
     println!();
-    println!("Server:       running (port {port_val}, uptime {uptime_str})");
+    println!(
+        "Server:       running (port {port_val}, uptime {})",
+        format_uptime(uptime)
+    );
     println!("Mode:         {mode}");
     println!("Concurrency:  {active}/{max} active");
     println!();
@@ -51,20 +110,40 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
                 .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
 
-            let status_icon = if avail { "✓" } else { "✗" };
+            let icon = if avail { "✓" } else { "✗" };
             let tag_str = if tags.is_empty() {
                 String::new()
             } else {
                 format!(" ({})", tags.join(", "))
             };
             let avail_str = if avail { "available" } else { "unavailable" };
-            println!("  {status_icon} {name:<24}{avail_str}{tag_str}");
+            println!("  {icon} {name:<24}{avail_str}{tag_str}");
         }
 
         println!();
         println!("  Total: {available_count}/{total} available");
     }
 
+    Ok(0)
+}
+
+fn emit_not_running(port: u16, source: PortSource, json_output: bool) -> anyhow::Result<()> {
+    if json_output {
+        let obj = serde_json::json!({
+            "running": false,
+            "checked_port": port,
+            "source": source.as_str()
+        });
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+    } else {
+        println!("AccelMars Gateway");
+        println!();
+        println!(
+            "Server:      not running (checked port {port} via {})",
+            source.as_str()
+        );
+        println!("Tip: start with `gateway serve`");
+    }
     Ok(())
 }
 

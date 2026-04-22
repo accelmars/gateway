@@ -34,6 +34,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 integration-tests = []
 record-fixtures = []
