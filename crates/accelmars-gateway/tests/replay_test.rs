@@ -55,9 +55,17 @@ async fn start_replay_server(fixture_name: &str) -> String {
     let auth_store = Arc::new(AuthStore::in_memory().unwrap());
 
     tokio::spawn(async move {
-        serve_with_listener(listener, router, limiter, cost_tracker, auth_store, true, port)
-            .await
-            .ok();
+        serve_with_listener(
+            listener,
+            router,
+            limiter,
+            cost_tracker,
+            auth_store,
+            true,
+            port,
+        )
+        .await
+        .ok();
     });
     tokio::task::yield_now().await;
 
