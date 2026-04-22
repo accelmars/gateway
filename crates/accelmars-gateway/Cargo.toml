@@ -36,5 +36,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 [features]
 integration-tests = []
+record-fixtures = []
 
 [dev-dependencies]

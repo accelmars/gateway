@@ -1,0 +1,94 @@
+{
+  "schema_version": "1",
+  "provider": "gemini",
+  "recorded_at": "2026-04-21T00:00:00Z",
+  "entries": [
+    {
+      "request": {
+        "tier": "quick",
+        "constraints": {
+          "privacy": "open",
+          "latency": "normal",
+          "cost": "default",
+          "capabilities": [],
+          "provider": null
+        },
+        "messages": [
+          { "role": "user", "content": "Hello" }
+        ],
+        "max_tokens": null,
+        "stream": false,
+        "metadata": {}
+      },
+      "response": {
+        "type": "success",
+        "id": "multi-turn-1",
+        "model": "gemini-2.0-flash",
+        "content": "Hello! How can I assist you today?",
+        "tokens_in": 5,
+        "tokens_out": 10,
+        "finish_reason": "stop"
+      }
+    },
+    {
+      "request": {
+        "tier": "quick",
+        "constraints": {
+          "privacy": "open",
+          "latency": "normal",
+          "cost": "default",
+          "capabilities": [],
+          "provider": null
+        },
+        "messages": [
+          { "role": "user", "content": "Hello" },
+          { "role": "assistant", "content": "Hello! How can I assist you today?" },
+          { "role": "user", "content": "What is 2+2?" }
+        ],
+        "max_tokens": null,
+        "stream": false,
+        "metadata": {}
+      },
+      "response": {
+        "type": "success",
+        "id": "multi-turn-2",
+        "model": "gemini-2.0-flash",
+        "content": "4",
+        "tokens_in": 25,
+        "tokens_out": 1,
+        "finish_reason": "stop"
+      }
+    },
+    {
+      "request": {
+        "tier": "quick",
+        "constraints": {
+          "privacy": "open",
+          "latency": "normal",
+          "cost": "default",
+          "capabilities": [],
+          "provider": null
+        },
+        "messages": [
+          { "role": "user", "content": "Hello" },
+          { "role": "assistant", "content": "Hello! How can I assist you today?" },
+          { "role": "user", "content": "What is 2+2?" },
+          { "role": "assistant", "content": "4" },
+          { "role": "user", "content": "Thanks" }
+        ],
+        "max_tokens": null,
+        "stream": false,
+        "metadata": {}
+      },
+      "response": {
+        "type": "success",
+        "id": "multi-turn-3",
+        "model": "gemini-2.0-flash",
+        "content": "You're welcome!",
+        "tokens_in": 35,
+        "tokens_out": 5,
+        "finish_reason": "stop"
+      }
+    }
+  ]
+}
