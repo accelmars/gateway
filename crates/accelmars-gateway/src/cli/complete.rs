@@ -1,10 +1,24 @@
 use std::sync::Arc;
 
-use accelmars_gateway_core::{GatewayRequest, Message, ModelTier, RoutingConstraints};
+use accelmars_gateway_core::{
+    CostPreference, GatewayRequest, Latency, Message, ModelTier, Privacy, RoutingConstraints,
+};
 
 use crate::config::GatewayConfig;
 use crate::registry::AdapterRegistry;
 use crate::router::Router;
+
+/// Routing constraint flags accepted by `gateway complete`.
+pub struct CompleteConstraints {
+    /// Privacy constraint: "open" | "sensitive" | "private"
+    pub privacy: Option<String>,
+    /// Cost constraint: "free" | "budget" | "default" | "unlimited"
+    pub cost: Option<String>,
+    /// Latency constraint: "normal" | "low"
+    pub latency: Option<String>,
+    /// Explicit provider override (bypasses tier routing)
+    pub provider: Option<String>,
+}
 
 /// `gateway complete` — one-shot completion without running the server.
 pub async fn run(
@@ -12,12 +26,15 @@ pub async fn run(
     tier: ModelTier,
     prompt: &str,
     json_output: bool,
+    constraints_in: &CompleteConstraints,
 ) -> anyhow::Result<()> {
     let registry = build_registry(config);
     let router = Arc::new(Router::new(config.clone(), registry));
 
+    let constraints = parse_constraints(constraints_in);
+
     let decision = router
-        .resolve(tier, &RoutingConstraints::default())
+        .resolve(tier, &constraints)
         .map_err(|e| anyhow::anyhow!("routing failed: {e}"))?;
 
     let provider_name = decision.provider_name.clone();
@@ -26,7 +43,7 @@ pub async fn run(
 
     let gateway_req = GatewayRequest {
         tier,
-        constraints: RoutingConstraints::default(),
+        constraints,
         messages: vec![Message {
             role: "user".to_string(),
             content: prompt.to_string(),
@@ -70,6 +87,40 @@ pub async fn run(
     Ok(())
 }
 
+/// Parse CLI constraint flags into a `RoutingConstraints` value.
+///
+/// Applies the same mapping as `server.rs::parse_constraints()` so the
+/// CLI and HTTP API behave identically.
+pub fn parse_constraints(flags: &CompleteConstraints) -> RoutingConstraints {
+    let mut c = RoutingConstraints::default();
+
+    if let Some(ref s) = flags.privacy {
+        c.privacy = match s.as_str() {
+            "sensitive" => Privacy::Sensitive,
+            "private" => Privacy::Private,
+            _ => Privacy::Open,
+        };
+    }
+    if let Some(ref s) = flags.latency {
+        if s == "low" {
+            c.latency = Latency::Low;
+        }
+    }
+    if let Some(ref s) = flags.cost {
+        c.cost = match s.as_str() {
+            "free" => CostPreference::Free,
+            "budget" => CostPreference::Budget,
+            "unlimited" => CostPreference::Unlimited,
+            _ => CostPreference::Default,
+        };
+    }
+    if let Some(ref s) = flags.provider {
+        c.provider = Some(s.clone());
+    }
+
+    c
+}
+
 fn build_registry(config: &GatewayConfig) -> AdapterRegistry {
     use crate::adapters::{
         new_deepseek_adapter, new_groq_adapter, new_openrouter_adapter, ClaudeAdapter,
@@ -103,4 +154,77 @@ fn build_registry(config: &GatewayConfig) -> AdapterRegistry {
     }
 
     registry
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — constraint parsing
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use accelmars_gateway_core::{CostPreference, Latency, Privacy};
+
+    #[test]
+    fn no_flags_produces_default_constraints() {
+        let flags = CompleteConstraints {
+            privacy: None,
+            cost: None,
+            latency: None,
+            provider: None,
+        };
+        let c = parse_constraints(&flags);
+        assert_eq!(c.privacy, Privacy::Open);
+        assert_eq!(c.cost, CostPreference::Default);
+        assert_eq!(c.latency, Latency::Normal);
+        assert!(c.provider.is_none());
+    }
+
+    #[test]
+    fn privacy_sensitive_flag_sets_constraint() {
+        let flags = CompleteConstraints {
+            privacy: Some("sensitive".to_string()),
+            cost: None,
+            latency: None,
+            provider: None,
+        };
+        let c = parse_constraints(&flags);
+        assert_eq!(c.privacy, Privacy::Sensitive);
+    }
+
+    #[test]
+    fn cost_free_flag_sets_constraint() {
+        let flags = CompleteConstraints {
+            privacy: None,
+            cost: Some("free".to_string()),
+            latency: None,
+            provider: None,
+        };
+        let c = parse_constraints(&flags);
+        assert_eq!(c.cost, CostPreference::Free);
+    }
+
+    #[test]
+    fn provider_override_flag_sets_provider() {
+        let flags = CompleteConstraints {
+            privacy: None,
+            cost: None,
+            latency: None,
+            provider: Some("claude".to_string()),
+        };
+        let c = parse_constraints(&flags);
+        assert_eq!(c.provider.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn latency_low_flag_sets_constraint() {
+        let flags = CompleteConstraints {
+            privacy: None,
+            cost: None,
+            latency: Some("low".to_string()),
+            provider: None,
+        };
+        let c = parse_constraints(&flags);
+        assert_eq!(c.latency, Latency::Low);
+    }
 }

@@ -6,9 +6,12 @@ use accelmars_gateway::adapters::{
     new_deepseek_adapter, new_groq_adapter, new_openrouter_adapter, ClaudeAdapter, GeminiAdapter,
 };
 use accelmars_gateway::cli;
+use accelmars_gateway::cli::complete::CompleteConstraints;
+use accelmars_gateway::cli::status::PortSource;
 use accelmars_gateway::concurrency::ConcurrencyLimiter;
 use accelmars_gateway::config::GatewayConfig;
 use accelmars_gateway::cost::CostTracker;
+use accelmars_gateway::pid;
 use accelmars_gateway::registry::AdapterRegistry;
 use accelmars_gateway::router::Router;
 use accelmars_gateway::server;
@@ -43,12 +46,15 @@ enum Commands {
     },
     /// Show gateway health and provider availability
     Status {
-        /// Port the server is listening on (default: read from config)
+        /// Port the server is listening on (overrides PID file and config)
         #[arg(long)]
         port: Option<u16>,
         /// Path to config file (to read port default)
         #[arg(long)]
         config: Option<std::path::PathBuf>,
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
     },
     /// Show cost summary and call statistics
     Stats {
@@ -78,6 +84,24 @@ enum Commands {
         /// Path to config file (default: gateway.toml in CWD)
         #[arg(long)]
         config: Option<std::path::PathBuf>,
+        /// Privacy constraint: open | sensitive | private
+        #[arg(long)]
+        privacy: Option<String>,
+        /// Cost constraint: free | budget | default | unlimited
+        #[arg(long)]
+        cost: Option<String>,
+        /// Latency constraint: normal | low
+        #[arg(long)]
+        latency: Option<String>,
+        /// Explicit provider override (bypasses tier routing)
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// Stop a running gateway server
+    Stop {
+        /// Port the server is listening on (default: read from PID file)
+        #[arg(long)]
+        port: Option<u16>,
     },
 }
 
@@ -162,6 +186,41 @@ async fn main() {
             }
 
             let serve_port = gateway_config.port;
+
+            // --- PID file: check for already-running instance ---
+            if let Some(existing) = pid::read() {
+                if pid::is_alive(existing.pid) {
+                    eprintln!(
+                        "error: Gateway already running on port {} (pid {}). \
+                        Use `gateway status --port {}` to check.",
+                        existing.port, existing.pid, existing.port
+                    );
+                    std::process::exit(1);
+                } else {
+                    tracing::warn!(
+                        pid = existing.pid,
+                        "stale PID file found (process not running) — overwriting"
+                    );
+                }
+            }
+
+            // --- Write PID file before starting server ---
+            let pid_info = pid::PidInfo {
+                pid: std::process::id(),
+                port: serve_port,
+                started: pid::iso_now(),
+            };
+            if let Err(e) = pid::write(&pid_info) {
+                tracing::warn!("failed to write PID file (non-fatal): {e:#}");
+            } else {
+                tracing::info!(
+                    pid = pid_info.pid,
+                    port = serve_port,
+                    path = %pid::default_path().display(),
+                    "PID file written"
+                );
+            }
+
             let max_concurrent = gateway_config.concurrency.max as usize;
             let registry = build_registry_from_config(&gateway_config);
             let router = Arc::new(Router::new(gateway_config, registry));
@@ -172,7 +231,6 @@ async fn main() {
                 Ok(t) => Arc::new(t),
                 Err(e) => {
                     tracing::warn!("cost tracker unavailable (fail-open): {e:#}");
-                    // Create an in-memory fallback so the server still starts
                     match CostTracker::open(std::path::Path::new(":memory:")) {
                         Ok(t) => Arc::new(t),
                         Err(e2) => {
@@ -185,18 +243,40 @@ async fn main() {
 
             if let Err(e) = server::serve(serve_port, router, limiter, cost_tracker).await {
                 tracing::error!("gateway server error: {e:#}");
+                pid::cleanup();
                 std::process::exit(1);
             }
+
+            // Graceful shutdown: remove PID file
+            pid::cleanup();
         }
 
-        Some(Commands::Status { port, config }) => {
-            let config_path = config.as_deref();
-            let gateway_config = GatewayConfig::load(config_path).unwrap_or_default();
-            let resolved_port = port.unwrap_or(gateway_config.port);
+        Some(Commands::Status { port, config, json }) => {
+            // Port resolution order:
+            // 1. --port flag (highest priority)
+            // 2. PID file port (auto-discovery)
+            // 3. Config file port
+            // 4. 8080 default
+            let (resolved_port, source) = if let Some(p) = port {
+                (p, PortSource::Flag)
+            } else if let Some(pid_info) = pid::read() {
+                (pid_info.port, PortSource::PidFile)
+            } else {
+                let config_path = config.as_deref();
+                let gateway_config = GatewayConfig::load(config_path).unwrap_or_default();
+                if gateway_config.port != 8080 {
+                    (gateway_config.port, PortSource::Config)
+                } else {
+                    (gateway_config.port, PortSource::Default)
+                }
+            };
 
-            if let Err(e) = cli::status::run(resolved_port).await {
-                eprintln!("error: {e:#}");
-                std::process::exit(1);
+            match cli::status::run(resolved_port, source, json).await {
+                Ok(exit_code) => std::process::exit(exit_code),
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    std::process::exit(2);
+                }
             }
         }
 
@@ -219,6 +299,10 @@ async fn main() {
             tier,
             json,
             config,
+            privacy,
+            cost,
+            latency,
+            provider,
         }) => {
             let config_path = config.as_deref();
             let gateway_config = match GatewayConfig::load(config_path) {
@@ -237,10 +321,24 @@ async fn main() {
                 }
             };
 
-            if let Err(e) = cli::complete::run(&gateway_config, model_tier, &prompt, json).await {
+            let constraints = CompleteConstraints {
+                privacy,
+                cost,
+                latency,
+                provider,
+            };
+
+            if let Err(e) =
+                cli::complete::run(&gateway_config, model_tier, &prompt, json, &constraints).await
+            {
                 eprintln!("error: {e:#}");
                 std::process::exit(1);
             }
+        }
+
+        Some(Commands::Stop { port }) => {
+            let exit_code = cli::stop::run(port);
+            std::process::exit(exit_code);
         }
 
         None => {

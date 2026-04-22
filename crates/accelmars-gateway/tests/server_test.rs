@@ -674,3 +674,72 @@ async fn twenty_concurrent_requests_all_complete_no_deadlock() {
         summary.total_calls
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 16: gateway status CLI — exit 0 when server is running
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn status_cli_returns_exit_0_when_server_running() {
+    use accelmars_gateway::cli::status::{run as status_run, PortSource};
+
+    let base = start_test_server().await;
+    // Extract port from base URL "http://127.0.0.1:PORT"
+    let port: u16 = base
+        .split(':')
+        .last()
+        .unwrap()
+        .parse()
+        .expect("port should parse");
+
+    let exit_code = status_run(port, PortSource::Flag, false)
+        .await
+        .expect("status should not return Err when server is running");
+
+    assert_eq!(exit_code, 0, "exit 0 expected when server is running");
+}
+
+// ---------------------------------------------------------------------------
+// Test 17: gateway status CLI — exit 1 when server is not running
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn status_cli_returns_exit_1_when_server_not_running() {
+    use accelmars_gateway::cli::status::{run as status_run, PortSource};
+
+    // Bind to port 0 to get an OS-assigned free port, then drop the listener so nothing is listening.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener); // nothing is listening on this port now
+
+    // Brief yield so OS can reclaim the port
+    tokio::task::yield_now().await;
+
+    let exit_code = status_run(port, PortSource::Flag, false)
+        .await
+        .expect("status should return Ok(1), not Err, when server is not running");
+
+    assert_eq!(exit_code, 1, "exit 1 expected when server is not running");
+}
+
+// ---------------------------------------------------------------------------
+// Test 18: gateway status CLI --json — returns structured JSON when running
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn status_cli_json_mode_returns_running_true() {
+    use accelmars_gateway::cli::status::{run as status_run, PortSource};
+
+    let base = start_test_server().await;
+    let port: u16 = base.split(':').last().unwrap().parse().unwrap();
+
+    // Run with json_output=true — output goes to stdout but we verify exit code
+    let exit_code = status_run(port, PortSource::PidFile, true)
+        .await
+        .expect("status --json should not Err when server is running");
+
+    assert_eq!(
+        exit_code, 0,
+        "exit 0 expected in JSON mode when server is running"
+    );
+}

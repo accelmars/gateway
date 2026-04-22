@@ -4,6 +4,7 @@ pub mod concurrency;
 pub mod config;
 pub mod cost;
 pub mod openai;
+pub mod pid;
 pub mod registry;
 pub mod router;
 pub mod server;
