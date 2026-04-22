@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use accelmars_gateway::adapters::{
     new_deepseek_adapter, new_groq_adapter, new_openrouter_adapter, ClaudeAdapter, GeminiAdapter,
 };
+use accelmars_gateway::auth::AuthStore;
 use accelmars_gateway::cli;
 use accelmars_gateway::cli::complete::CompleteConstraints;
 use accelmars_gateway::cli::status::PortSource;
@@ -103,6 +104,32 @@ enum Commands {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// Manage API keys
+    Keys {
+        #[command(subcommand)]
+        action: KeysAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeysAction {
+    /// Create a new API key
+    Create {
+        /// Human-readable name for this key
+        #[arg(long)]
+        name: String,
+    },
+    /// List all API keys
+    List {
+        /// Output JSON instead of table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke an API key by prefix (e.g., gw_live_a8f2)
+    Revoke {
+        /// Key prefix shown in `gateway keys list`
+        prefix: String,
+    },
 }
 
 fn build_registry_from_config(config: &GatewayConfig) -> AdapterRegistry {
@@ -187,6 +214,29 @@ async fn main() {
 
             let serve_port = gateway_config.port;
 
+            // Auth setup — read env var once at startup, store in AppState.
+            let auth_disabled = std::env::var("GATEWAY_AUTH_DISABLED").is_ok();
+            if auth_disabled {
+                tracing::warn!(
+                    "Authentication disabled (GATEWAY_AUTH_DISABLED is set). Do NOT use in production."
+                );
+            }
+
+            let auth_db_path = AuthStore::default_path();
+            let auth_store = match AuthStore::open(&auth_db_path) {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    tracing::warn!("auth store unavailable (fail-open): {e:#}");
+                    match AuthStore::in_memory() {
+                        Ok(s) => Arc::new(s),
+                        Err(e2) => {
+                            tracing::error!("auth store fallback also failed: {e2:#}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            };
+
             // --- PID file: check for already-running instance ---
             if let Some(existing) = pid::read() {
                 if pid::is_alive(existing.pid) {
@@ -241,7 +291,16 @@ async fn main() {
                 }
             };
 
-            if let Err(e) = server::serve(serve_port, router, limiter, cost_tracker).await {
+            if let Err(e) = server::serve(
+                serve_port,
+                router,
+                limiter,
+                cost_tracker,
+                auth_store,
+                auth_disabled,
+            )
+            .await
+            {
                 tracing::error!("gateway server error: {e:#}");
                 pid::cleanup();
                 std::process::exit(1);
@@ -339,6 +398,29 @@ async fn main() {
         Some(Commands::Stop { port }) => {
             let exit_code = cli::stop::run(port);
             std::process::exit(exit_code);
+        }
+
+        Some(Commands::Keys { action }) => {
+            let auth_store = match AuthStore::open(&AuthStore::default_path()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: failed to open auth store: {e:#}");
+                    std::process::exit(1);
+                }
+            };
+
+            match action {
+                KeysAction::Create { name } => {
+                    cli::keys::create(&auth_store, &name);
+                }
+                KeysAction::List { json } => {
+                    cli::keys::list(&auth_store, json);
+                }
+                KeysAction::Revoke { prefix } => {
+                    let exit_code = cli::keys::revoke(&auth_store, &prefix);
+                    std::process::exit(exit_code);
+                }
+            }
         }
 
         None => {

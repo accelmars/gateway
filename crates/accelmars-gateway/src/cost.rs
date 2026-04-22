@@ -23,6 +23,8 @@ pub struct RequestRecord {
     pub status: String,
     pub error_type: Option<String>,
     pub constraints: Option<String>,
+    /// API key ID that made this request — used for per-key cost attribution (Phase 2/3 billing).
+    pub key_id: Option<String>,
 }
 
 /// Aggregated stats returned by `CostTracker::summary()`.
@@ -104,9 +106,12 @@ impl CostTracker {
                 latency_ms  INTEGER NOT NULL,
                 status      TEXT    NOT NULL,
                 error_type  TEXT,
-                constraints TEXT
+                constraints TEXT,
+                key_id      TEXT
             );",
         )?;
+        // Migrate existing databases — silently ignored if column already exists
+        let _ = conn.execute("ALTER TABLE requests ADD COLUMN key_id TEXT", []);
         Ok(())
     }
 
@@ -122,8 +127,8 @@ impl CostTracker {
         if let Err(e) = conn.execute(
             "INSERT OR IGNORE INTO requests
                 (id, timestamp, tier, provider, model, tokens_in, tokens_out,
-                 cost_usd, latency_ms, status, error_type, constraints)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 cost_usd, latency_ms, status, error_type, constraints, key_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 &record.id,
                 &record.timestamp,
@@ -137,6 +142,7 @@ impl CostTracker {
                 &record.status,
                 &record.error_type,
                 &record.constraints,
+                &record.key_id,
             ],
         ) {
             warn!("cost tracker write error (fail-open) — request still completed: {e}");
@@ -253,6 +259,7 @@ mod tests {
             status: "ok".to_string(),
             error_type: None,
             constraints: None,
+            key_id: None,
         }
     }
 
@@ -304,6 +311,7 @@ mod tests {
             status: "ok".to_string(),
             error_type: None,
             constraints: None,
+            key_id: None,
         });
         tracker.record(&RequestRecord {
             id: "r2".to_string(),
@@ -318,6 +326,7 @@ mod tests {
             status: "ok".to_string(),
             error_type: None,
             constraints: None,
+            key_id: None,
         });
 
         let summary = tracker.summary(None).unwrap();
@@ -349,6 +358,7 @@ mod tests {
             status: "ok".to_string(),
             error_type: None,
             constraints: None,
+            key_id: None,
         });
         tracker.record(&RequestRecord {
             id: "new".to_string(),
@@ -363,6 +373,7 @@ mod tests {
             status: "ok".to_string(),
             error_type: None,
             constraints: None,
+            key_id: None,
         });
 
         let all = tracker.summary(None).unwrap();

@@ -7,6 +7,51 @@
 
 ---
 
+## Authentication
+
+Every request to the gateway must include an API key:
+
+```
+Authorization: Bearer gw_live_a8f2c9d1e4b7...
+```
+
+Generate a key with:
+
+```bash
+gateway keys create --name "my-laptop"
+```
+
+Manage keys:
+
+```bash
+gateway keys list            # show all keys (table)
+gateway keys list --json     # machine-readable
+gateway keys revoke gw_live_a8f2  # revoke by prefix
+```
+
+Set via environment variable (engines should read this):
+
+```bash
+export ACCELMARS_GATEWAY_KEY=gw_live_a8f2c9d1e4b7...
+```
+
+For local development without auth (e.g., mock mode):
+
+```bash
+GATEWAY_AUTH_DISABLED=1 gateway serve
+```
+
+**Auth errors:**
+
+| HTTP | `error.code` | Meaning |
+|------|-------------|---------|
+| 401 | `invalid_api_key` | Missing `Authorization: Bearer <key>` header |
+| 401 | `invalid_api_key` | Key is invalid, expired, or revoked |
+
+The `/health` and `/status` endpoints are always exempt from auth — load balancers and the `gateway status` CLI do not require keys.
+
+---
+
 ## Quick Start (5 minutes)
 
 Start the gateway, then send a completion request:

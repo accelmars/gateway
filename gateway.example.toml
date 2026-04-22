@@ -6,8 +6,15 @@
 #   GATEWAY__TIERS__STANDARD=claude
 #   GATEWAY__PROVIDERS__DEEPSEEK__API_KEY_ENV=MY_DEEPSEEK_KEY
 #
-# Special env var:
-#   GATEWAY_MODE=mock   — forces all requests to MockAdapter (no AI calls)
+# Special env vars:
+#   GATEWAY_MODE=mock            — forces all requests to MockAdapter (no AI calls)
+#   GATEWAY_AUTH_DISABLED=1      — disables API key auth (local dev only, NOT for production)
+#   GATEWAY_AUTH_DB_PATH=<path>  — override auth DB location (default: ~/.accelmars-gateway-auth.db)
+#
+# API Key Management:
+#   gateway keys create --name "my-laptop"   — generate a new key (shown once, store securely)
+#   gateway keys list                         — show all keys
+#   gateway keys revoke gw_live_a8f2         — revoke a key by prefix
 
 # HTTP port for the OpenAI-compatible API server
 port = 8080
