@@ -180,10 +180,9 @@ fn build_registry_from_config(config: &GatewayConfig) -> AdapterRegistry {
 async fn main() {
     let cli = Cli::parse();
 
-    // Initialize structured tracing
-    let filter = tracing_subscriber::EnvFilter::try_new(&cli.log_level)
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Initialize tracing with optional OpenTelemetry export.
+    // OTel activates when OTEL_EXPORTER_OTLP_ENDPOINT is set; otherwise fmt-only.
+    let tracer_provider = accelmars_gateway::telemetry::init_tracing(&cli.log_level);
 
     match cli.command {
         Some(Commands::Serve { port, config }) => {
@@ -302,11 +301,13 @@ async fn main() {
             .await
             {
                 tracing::error!("gateway server error: {e:#}");
+                accelmars_gateway::telemetry::shutdown_tracing(tracer_provider);
                 pid::cleanup();
                 std::process::exit(1);
             }
 
-            // Graceful shutdown: remove PID file
+            // Graceful shutdown: flush OTel spans, then remove PID file
+            accelmars_gateway::telemetry::shutdown_tracing(tracer_provider);
             pid::cleanup();
         }
 

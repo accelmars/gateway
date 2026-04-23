@@ -12,7 +12,8 @@ use axum::Router as AxumRouter;
 use futures_util::stream;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, Instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use accelmars_gateway_core::{
     AdapterError, Capability, CostPreference, GatewayRequest, Latency, Message, ModelTier, Privacy,
@@ -239,86 +240,119 @@ async fn handle_completion(
     key_id: Option<axum::extract::Extension<String>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
-    let key_id = key_id.map(|ext| ext.0);
+    let span = tracing::info_span!("chat_completion");
 
-    // Validate messages present
-    if req.messages.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::invalid_request("messages cannot be empty")),
-        )
-            .into_response();
-    }
+    async {
+        let key_id = key_id.map(|ext| ext.0);
 
-    // Parse tier from model field (quick / standard / max / ultra)
-    let tier = match req.model.parse::<ModelTier>() {
-        Ok(t) => t,
-        Err(_) => {
+        // Validate messages present
+        if req.messages.is_empty() {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::invalid_model(&req.model)),
+                Json(ErrorResponse::invalid_request("messages cannot be empty")),
             )
                 .into_response();
         }
-    };
 
-    let constraints = parse_constraints(&req);
-    let is_stream = req.stream.unwrap_or(false);
+        // Parse tier from model field (quick / standard / max / ultra)
+        let tier = match req.model.parse::<ModelTier>() {
+            Ok(t) => t,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::invalid_model(&req.model)),
+                )
+                    .into_response();
+            }
+        };
 
-    // Acquire concurrency permit — queues until a slot opens or 30s timeout → 504
-    let _permit = match state.limiter.acquire().await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("concurrency queue timeout: {e}");
-            return (
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(ErrorResponse {
-                    error: ErrorDetail {
-                        message: e.to_string(),
-                        error_type: "rate_limit_error".to_string(),
-                        code: "concurrency_timeout".to_string(),
-                    },
-                }),
-            )
-                .into_response();
+        let constraints = parse_constraints(&req);
+        let is_stream = req.stream.unwrap_or(false);
+
+        // Extract engine identifier from metadata (cortex, guild, etc.)
+        let engine = req
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("engine"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        // Set engine attribute on the span if provided
+        if let Some(ref engine) = engine {
+            tracing::Span::current()
+                .set_attribute(crate::telemetry::GATEWAY_ENGINE, engine.clone());
         }
-    };
 
-    // Resolve provider via router (tier + constraints → RouteDecision)
-    let decision = match state.router.resolve(tier, &constraints) {
-        Ok(d) => d,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::provider_error(e.to_string())),
-            )
-                .into_response();
+        // Set max_tokens on span if provided
+        if let Some(max_tokens) = req.max_tokens {
+            tracing::Span::current().set_attribute(
+                crate::telemetry::GEN_AI_REQUEST_MAX_TOKENS,
+                i64::from(max_tokens),
+            );
         }
-    };
 
-    let gateway_req = GatewayRequest {
-        tier,
-        constraints,
-        messages: req
-            .messages
-            .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: m.content.clone(),
-            })
-            .collect(),
-        max_tokens: req.max_tokens,
-        stream: is_stream,
-        metadata: Default::default(),
-    };
+        // Acquire concurrency permit — queues until a slot opens or 30s timeout → 504
+        let _permit = match state.limiter.acquire().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("concurrency queue timeout: {e}");
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(ErrorResponse {
+                        error: ErrorDetail {
+                            message: e.to_string(),
+                            error_type: "rate_limit_error".to_string(),
+                            code: "concurrency_timeout".to_string(),
+                        },
+                    }),
+                )
+                    .into_response();
+            }
+        };
 
-    if is_stream {
-        complete_stream(state, decision, tier, gateway_req, key_id).await
-        // _permit dropped here — slot released after streaming completes
-    } else {
-        complete_json(state, decision, tier, gateway_req, key_id).await
-        // _permit dropped here — slot released after JSON response returned
+        // Measure gateway routing overhead (resolve + request assembly, excludes provider latency)
+        let resolve_start = Instant::now();
+
+        // Resolve provider via router (tier + constraints → RouteDecision)
+        let decision = match state.router.resolve(tier, &constraints) {
+            Ok(d) => d,
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse::provider_error(e.to_string())),
+                )
+                    .into_response();
+            }
+        };
+
+        let gateway_req = GatewayRequest {
+            tier,
+            constraints,
+            messages: req
+                .messages
+                .iter()
+                .map(|m| Message {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                })
+                .collect(),
+            max_tokens: req.max_tokens,
+            stream: is_stream,
+            metadata: Default::default(),
+        };
+
+        let overhead_ms = resolve_start.elapsed().as_millis() as u64;
+
+        if is_stream {
+            complete_stream(state, decision, tier, gateway_req, key_id, overhead_ms).await
+            // _permit dropped here — slot released after streaming completes
+        } else {
+            complete_json(state, decision, tier, gateway_req, key_id, overhead_ms).await
+            // _permit dropped here — slot released after JSON response returned
+        }
     }
+    .instrument(span)
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -331,12 +365,14 @@ async fn complete_json(
     tier: ModelTier,
     gateway_req: GatewayRequest,
     key_id: Option<String>,
+    overhead_ms: u64,
 ) -> Response {
     // Retry loop: up to 3 attempts, re-resolving via the fallback chain on each adapter failure.
     // The concurrency permit (_permit in handle_completion) covers the entire loop — one slot
     // per request regardless of how many fallback attempts are made.
     const MAX_ATTEMPTS: u32 = 3;
     let mut current_decision = decision;
+    let total_start = Instant::now();
 
     for attempt in 0..MAX_ATTEMPTS {
         let start = Instant::now();
@@ -424,6 +460,7 @@ async fn complete_json(
                 return (status, Json(body)).into_response();
             }
             Ok(Ok(resp)) => {
+                let total_latency_ms = total_start.elapsed().as_millis() as u64;
                 info!(
                     tier = %tier,
                     provider = %provider_name,
@@ -442,6 +479,36 @@ async fn complete_json(
                     cost_in,
                     cost_out,
                 );
+
+                // Set OTel span attributes — GenAI semantic conventions + gateway attributes.
+                // When OTel is not active, these calls are no-ops.
+                let span = tracing::Span::current();
+                span.set_attribute(
+                    crate::telemetry::GEN_AI_SYSTEM,
+                    crate::telemetry::provider_to_system(&provider_name),
+                );
+                span.set_attribute(crate::telemetry::GEN_AI_REQUEST_MODEL, resp.model.clone());
+                span.set_attribute(
+                    crate::telemetry::GEN_AI_USAGE_INPUT_TOKENS,
+                    resp.tokens_in as i64,
+                );
+                span.set_attribute(
+                    crate::telemetry::GEN_AI_USAGE_OUTPUT_TOKENS,
+                    resp.tokens_out as i64,
+                );
+                span.set_attribute(
+                    crate::telemetry::GEN_AI_RESPONSE_FINISH_REASONS,
+                    resp.finish_reason.clone(),
+                );
+                span.set_attribute(crate::telemetry::GATEWAY_TIER, tier.to_string());
+                span.set_attribute(crate::telemetry::GATEWAY_PROVIDER, provider_name.clone());
+                span.set_attribute(crate::telemetry::GATEWAY_COST_USD, cost_usd);
+                span.set_attribute(
+                    crate::telemetry::GATEWAY_LATENCY_MS,
+                    total_latency_ms as i64,
+                );
+                span.set_attribute(crate::telemetry::GATEWAY_OVERHEAD_MS, overhead_ms as i64);
+                span.set_attribute(crate::telemetry::GATEWAY_FALLBACK, attempt > 0);
 
                 state.cost_tracker.record(&RequestRecord {
                     id: resp.id.clone(),
@@ -510,11 +577,13 @@ async fn complete_stream(
     tier: ModelTier,
     gateway_req: GatewayRequest,
     key_id: Option<String>,
+    overhead_ms: u64,
 ) -> Response {
     // Same retry-on-fallback pattern as complete_json. The concurrency permit
     // covers the entire retry loop — one slot per request.
     const MAX_ATTEMPTS: u32 = 3;
     let mut current_decision = decision;
+    let total_start = Instant::now();
 
     for attempt in 0..MAX_ATTEMPTS {
         let start = Instant::now();
@@ -570,6 +639,7 @@ async fn complete_stream(
                 return (status, Json(body)).into_response();
             }
             Ok(Ok(resp)) => {
+                let total_latency_ms = total_start.elapsed().as_millis() as u64;
                 state.router.on_success(&provider_name);
                 info!(
                     tier = %tier,
@@ -589,6 +659,36 @@ async fn complete_stream(
                     cost_in,
                     cost_out,
                 );
+
+                // Set OTel span attributes — GenAI semantic conventions + gateway attributes.
+                let span = tracing::Span::current();
+                span.set_attribute(
+                    crate::telemetry::GEN_AI_SYSTEM,
+                    crate::telemetry::provider_to_system(&provider_name),
+                );
+                span.set_attribute(crate::telemetry::GEN_AI_REQUEST_MODEL, resp.model.clone());
+                span.set_attribute(
+                    crate::telemetry::GEN_AI_USAGE_INPUT_TOKENS,
+                    resp.tokens_in as i64,
+                );
+                span.set_attribute(
+                    crate::telemetry::GEN_AI_USAGE_OUTPUT_TOKENS,
+                    resp.tokens_out as i64,
+                );
+                span.set_attribute(
+                    crate::telemetry::GEN_AI_RESPONSE_FINISH_REASONS,
+                    resp.finish_reason.clone(),
+                );
+                span.set_attribute(crate::telemetry::GATEWAY_TIER, tier.to_string());
+                span.set_attribute(crate::telemetry::GATEWAY_PROVIDER, provider_name.clone());
+                span.set_attribute(crate::telemetry::GATEWAY_COST_USD, cost_usd);
+                span.set_attribute(
+                    crate::telemetry::GATEWAY_LATENCY_MS,
+                    total_latency_ms as i64,
+                );
+                span.set_attribute(crate::telemetry::GATEWAY_OVERHEAD_MS, overhead_ms as i64);
+                span.set_attribute(crate::telemetry::GATEWAY_FALLBACK, attempt > 0);
+
                 state.cost_tracker.record(&RequestRecord {
                     id: resp.id.clone(),
                     timestamp: iso_now(),
