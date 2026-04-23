@@ -141,3 +141,23 @@ low_latency_preferred = ["groq"]
 
 # Providers available when cost=free (supplements "free" tag filtering)
 free_only = ["gemini-flash-lite", "gemini-flash", "groq"]
+
+# ---------------------------------------------------------------------------
+# Circuit Breaker
+#
+# Controls provider failure detection and recovery.
+# These are global defaults applied to all providers.
+# ---------------------------------------------------------------------------
+
+# Note: circuit breaker values are currently hardcoded constants in router.rs
+# (ProviderHealth::new). This section documents the contract for future
+# config-driven integration.
+
+[circuit_breaker]
+# Consecutive failures before marking provider unavailable (CLOSED → OPEN)
+max_failures = 3
+# Initial cooldown before probe attempt (OPEN → HALF-OPEN), in seconds
+cooldown_secs = 30
+# Maximum cooldown after exponential backoff, in seconds (cap)
+# Backoff sequence: 30 → 60 → 120 → 240 → 300 → 300 (held at max)
+max_cooldown_secs = 300
