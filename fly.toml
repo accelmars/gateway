@@ -1,0 +1,46 @@
+# fly.toml — AccelMars Gateway
+# Platform deployment. Future engines deploy as separate Fly apps.
+# Internal engine-to-gateway communication: http://accelmars-gateway.internal:8080 (Fly private networking)
+
+app = "accelmars-gateway"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  GATEWAY_MODE = "normal"
+  GATEWAY__PORT = "8080"
+  GATEWAY__LOG_LEVEL = "info"
+  GATEWAY__CONCURRENCY__MAX = "20"
+  # Point SQLite databases to persistent volume (survives machine restarts)
+  GATEWAY_DB_PATH = "/data/gateway.db"
+  GATEWAY_AUTH_DB_PATH = "/data/auth.db"
+
+# Persistent storage for SQLite databases (API keys + cost tracking)
+[mounts]
+  source = "gateway_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 100
+    soft_limit = 80
+
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "30s"
+  method = "GET"
+  path = "/health"
+  timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
