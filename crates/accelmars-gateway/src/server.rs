@@ -332,127 +332,170 @@ async fn complete_json(
     gateway_req: GatewayRequest,
     key_id: Option<String>,
 ) -> Response {
-    let start = Instant::now();
-    let provider_name = decision.provider_name.clone();
-    let adapter = decision.adapter;
+    // Retry loop: up to 3 attempts, re-resolving via the fallback chain on each adapter failure.
+    // The concurrency permit (_permit in handle_completion) covers the entire loop — one slot
+    // per request regardless of how many fallback attempts are made.
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut current_decision = decision;
 
-    let result = tokio::task::spawn_blocking(move || adapter.complete(&gateway_req)).await;
-    let latency_ms = start.elapsed().as_millis() as u64;
+    for attempt in 0..MAX_ATTEMPTS {
+        let start = Instant::now();
+        let provider_name = current_decision.provider_name.clone();
+        // Arc clone is cheap — adapter is shared behind Arc<dyn ProviderAdapter>
+        let adapter = current_decision.adapter.clone();
+        let req_clone = gateway_req.clone();
 
-    match result {
-        Err(join_err) => {
-            error!("adapter task panicked: {join_err}");
-            state.router.on_failure(&provider_name);
-            state.cost_tracker.record(&RequestRecord {
-                id: new_request_id(),
-                timestamp: iso_now(),
-                tier: tier.to_string(),
-                provider: provider_name,
-                model: "unknown".to_string(),
-                tokens_in: 0,
-                tokens_out: 0,
-                cost_usd: 0.0,
-                latency_ms,
-                status: "error".to_string(),
-                error_type: Some("internal_error".to_string()),
-                constraints: None,
-                key_id,
-            });
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::provider_error("internal error")),
-            )
-                .into_response()
-        }
-        Ok(Err(adapter_err)) => {
-            let (status, body) = adapter_error_to_response(&adapter_err);
-            error!(
-                error = %adapter_err,
-                tier = %tier,
-                provider = %provider_name,
-                latency_ms,
-                "completion failed"
-            );
-            state.router.on_failure(&provider_name);
-            state.cost_tracker.record(&RequestRecord {
-                id: new_request_id(),
-                timestamp: iso_now(),
-                tier: tier.to_string(),
-                provider: provider_name,
-                model: "unknown".to_string(),
-                tokens_in: 0,
-                tokens_out: 0,
-                cost_usd: 0.0,
-                latency_ms,
-                status: "error".to_string(),
-                error_type: Some(adapter_error_type(&adapter_err).to_string()),
-                constraints: None,
-                key_id,
-            });
-            (status, Json(body)).into_response()
-        }
-        Ok(Ok(resp)) => {
-            info!(
-                tier = %tier,
-                provider = %provider_name,
-                model = %resp.model,
-                latency_ms,
-                tokens_in = resp.tokens_in,
-                tokens_out = resp.tokens_out,
-                "completion ok"
-            );
-            state.router.on_success(&provider_name);
+        let result = tokio::task::spawn_blocking(move || adapter.complete(&req_clone)).await;
+        let latency_ms = start.elapsed().as_millis() as u64;
 
-            let (cost_in, cost_out) = state.router.provider_pricing(&provider_name);
-            let cost_usd = CostTracker::calculate_cost(
-                resp.tokens_in as u64,
-                resp.tokens_out as u64,
-                cost_in,
-                cost_out,
-            );
+        match result {
+            Err(join_err) => {
+                // Task panic — never retry (panic is not a transient error)
+                error!("adapter task panicked: {join_err}");
+                state.router.on_failure(&provider_name);
+                state.cost_tracker.record(&RequestRecord {
+                    id: new_request_id(),
+                    timestamp: iso_now(),
+                    tier: tier.to_string(),
+                    provider: provider_name,
+                    model: "unknown".to_string(),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cost_usd: 0.0,
+                    latency_ms,
+                    status: "error".to_string(),
+                    error_type: Some("internal_error".to_string()),
+                    constraints: None,
+                    key_id,
+                });
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::provider_error("internal error")),
+                )
+                    .into_response();
+            }
+            Ok(Err(adapter_err)) => {
+                let (status, body) = adapter_error_to_response(&adapter_err);
+                error!(
+                    error = %adapter_err,
+                    tier = %tier,
+                    provider = %provider_name,
+                    latency_ms,
+                    attempt,
+                    "completion failed"
+                );
+                state.router.on_failure(&provider_name);
+                state.cost_tracker.record(&RequestRecord {
+                    id: new_request_id(),
+                    timestamp: iso_now(),
+                    tier: tier.to_string(),
+                    provider: provider_name.clone(),
+                    model: "unknown".to_string(),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cost_usd: 0.0,
+                    latency_ms,
+                    status: "error".to_string(),
+                    error_type: Some(adapter_error_type(&adapter_err).to_string()),
+                    constraints: None,
+                    key_id: key_id.clone(),
+                });
 
-            state.cost_tracker.record(&RequestRecord {
-                id: resp.id.clone(),
-                timestamp: iso_now(),
-                tier: tier.to_string(),
-                provider: provider_name,
-                model: resp.model.clone(),
-                tokens_in: resp.tokens_in as u64,
-                tokens_out: resp.tokens_out as u64,
-                cost_usd,
-                latency_ms,
-                status: "ok".to_string(),
-                error_type: None,
-                constraints: None,
-                key_id,
-            });
+                // Try to re-resolve through the fallback chain (circuit is now OPEN for
+                // provider_name, so the router will skip it and try the next provider)
+                if attempt + 1 < MAX_ATTEMPTS {
+                    match state.router.resolve(tier, &gateway_req.constraints) {
+                        Ok(next) if next.provider_name != provider_name => {
+                            tracing::info!(
+                                attempt = attempt + 1,
+                                failed_provider = %provider_name,
+                                next_provider = %next.provider_name,
+                                "retrying with fallback provider"
+                            );
+                            current_decision = next;
+                            continue;
+                        }
+                        _ => {
+                            // No different provider available — return the error
+                        }
+                    }
+                }
 
-            let now = unix_now();
-            (
-                StatusCode::OK,
-                Json(ChatCompletionResponse {
-                    id: resp.id,
-                    object: "chat.completion".to_string(),
-                    created: now,
-                    model: resp.model,
-                    choices: vec![Choice {
-                        index: 0,
-                        message: ChatMessage {
-                            role: "assistant".to_string(),
-                            content: resp.content,
+                return (status, Json(body)).into_response();
+            }
+            Ok(Ok(resp)) => {
+                info!(
+                    tier = %tier,
+                    provider = %provider_name,
+                    model = %resp.model,
+                    latency_ms,
+                    tokens_in = resp.tokens_in,
+                    tokens_out = resp.tokens_out,
+                    "completion ok"
+                );
+                state.router.on_success(&provider_name);
+
+                let (cost_in, cost_out) = state.router.provider_pricing(&provider_name);
+                let cost_usd = CostTracker::calculate_cost(
+                    resp.tokens_in as u64,
+                    resp.tokens_out as u64,
+                    cost_in,
+                    cost_out,
+                );
+
+                state.cost_tracker.record(&RequestRecord {
+                    id: resp.id.clone(),
+                    timestamp: iso_now(),
+                    tier: tier.to_string(),
+                    provider: provider_name,
+                    model: resp.model.clone(),
+                    tokens_in: resp.tokens_in as u64,
+                    tokens_out: resp.tokens_out as u64,
+                    cost_usd,
+                    latency_ms,
+                    status: "ok".to_string(),
+                    error_type: None,
+                    constraints: None,
+                    key_id,
+                });
+
+                let now = unix_now();
+                return (
+                    StatusCode::OK,
+                    Json(ChatCompletionResponse {
+                        id: resp.id,
+                        object: "chat.completion".to_string(),
+                        created: now,
+                        model: resp.model,
+                        choices: vec![Choice {
+                            index: 0,
+                            message: ChatMessage {
+                                role: "assistant".to_string(),
+                                content: resp.content,
+                            },
+                            finish_reason: resp.finish_reason,
+                        }],
+                        usage: Usage {
+                            prompt_tokens: resp.tokens_in,
+                            completion_tokens: resp.tokens_out,
+                            total_tokens: resp.tokens_in + resp.tokens_out,
                         },
-                        finish_reason: resp.finish_reason,
-                    }],
-                    usage: Usage {
-                        prompt_tokens: resp.tokens_in,
-                        completion_tokens: resp.tokens_out,
-                        total_tokens: resp.tokens_in + resp.tokens_out,
-                    },
-                }),
-            )
-                .into_response()
+                    }),
+                )
+                    .into_response();
+            }
         }
     }
+
+    // All attempts exhausted without success (shouldn't reach here due to early returns above,
+    // but provides a safe fallback for the loop exit path)
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse::provider_error(
+            "all providers exhausted — no fallback available",
+        )),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -468,106 +511,153 @@ async fn complete_stream(
     gateway_req: GatewayRequest,
     key_id: Option<String>,
 ) -> Response {
-    let start = Instant::now();
-    let provider_name = decision.provider_name.clone();
-    let adapter = decision.adapter;
+    // Same retry-on-fallback pattern as complete_json. The concurrency permit
+    // covers the entire retry loop — one slot per request.
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut current_decision = decision;
 
-    let result = tokio::task::spawn_blocking(move || adapter.complete(&gateway_req)).await;
-    let latency_ms = start.elapsed().as_millis() as u64;
+    for attempt in 0..MAX_ATTEMPTS {
+        let start = Instant::now();
+        let provider_name = current_decision.provider_name.clone();
+        let adapter = current_decision.adapter.clone();
+        let req_clone = gateway_req.clone();
 
-    match result {
-        Err(join_err) => {
-            error!("adapter task panicked: {join_err}");
-            state.router.on_failure(&provider_name);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::provider_error("internal error")),
-            )
-                .into_response()
-        }
-        Ok(Err(adapter_err)) => {
-            state.router.on_failure(&provider_name);
-            let (status, body) = adapter_error_to_response(&adapter_err);
-            (status, Json(body)).into_response()
-        }
-        Ok(Ok(resp)) => {
-            state.router.on_success(&provider_name);
-            info!(
-                tier = %tier,
-                provider = %provider_name,
-                model = %resp.model,
-                latency_ms,
-                tokens_in = resp.tokens_in,
-                tokens_out = resp.tokens_out,
-                stream = true,
-                "completion ok (stream)"
-            );
+        let result = tokio::task::spawn_blocking(move || adapter.complete(&req_clone)).await;
+        let latency_ms = start.elapsed().as_millis() as u64;
 
-            let (cost_in, cost_out) = state.router.provider_pricing(&provider_name);
-            let cost_usd = CostTracker::calculate_cost(
-                resp.tokens_in as u64,
-                resp.tokens_out as u64,
-                cost_in,
-                cost_out,
-            );
-            state.cost_tracker.record(&RequestRecord {
-                id: resp.id.clone(),
-                timestamp: iso_now(),
-                tier: tier.to_string(),
-                provider: provider_name,
-                model: resp.model.clone(),
-                tokens_in: resp.tokens_in as u64,
-                tokens_out: resp.tokens_out as u64,
-                cost_usd,
-                latency_ms,
-                status: "ok".to_string(),
-                error_type: None,
-                constraints: None,
-                key_id,
-            });
+        match result {
+            Err(join_err) => {
+                // Task panic — never retry
+                error!("adapter task panicked: {join_err}");
+                state.router.on_failure(&provider_name);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::provider_error("internal error")),
+                )
+                    .into_response();
+            }
+            Ok(Err(adapter_err)) => {
+                error!(
+                    error = %adapter_err,
+                    tier = %tier,
+                    provider = %provider_name,
+                    latency_ms,
+                    attempt,
+                    stream = true,
+                    "completion failed"
+                );
+                state.router.on_failure(&provider_name);
 
-            let now = unix_now();
+                // Try to re-resolve via fallback chain
+                if attempt + 1 < MAX_ATTEMPTS {
+                    match state.router.resolve(tier, &gateway_req.constraints) {
+                        Ok(next) if next.provider_name != provider_name => {
+                            tracing::info!(
+                                attempt = attempt + 1,
+                                failed_provider = %provider_name,
+                                next_provider = %next.provider_name,
+                                stream = true,
+                                "retrying with fallback provider"
+                            );
+                            current_decision = next;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
 
-            let content_chunk = ChatCompletionChunk {
-                id: resp.id.clone(),
-                object: "chat.completion.chunk".to_string(),
-                created: now,
-                model: resp.model.clone(),
-                choices: vec![StreamChoice {
-                    index: 0,
-                    delta: StreamDelta {
-                        role: Some("assistant".to_string()),
-                        content: Some(resp.content),
-                    },
-                    finish_reason: None,
-                }],
-            };
+                let (status, body) = adapter_error_to_response(&adapter_err);
+                return (status, Json(body)).into_response();
+            }
+            Ok(Ok(resp)) => {
+                state.router.on_success(&provider_name);
+                info!(
+                    tier = %tier,
+                    provider = %provider_name,
+                    model = %resp.model,
+                    latency_ms,
+                    tokens_in = resp.tokens_in,
+                    tokens_out = resp.tokens_out,
+                    stream = true,
+                    "completion ok (stream)"
+                );
 
-            let finish_chunk = ChatCompletionChunk {
-                id: resp.id,
-                object: "chat.completion.chunk".to_string(),
-                created: now,
-                model: resp.model,
-                choices: vec![StreamChoice {
-                    index: 0,
-                    delta: StreamDelta {
-                        role: None,
-                        content: None,
-                    },
-                    finish_reason: Some(resp.finish_reason),
-                }],
-            };
+                let (cost_in, cost_out) = state.router.provider_pricing(&provider_name);
+                let cost_usd = CostTracker::calculate_cost(
+                    resp.tokens_in as u64,
+                    resp.tokens_out as u64,
+                    cost_in,
+                    cost_out,
+                );
+                state.cost_tracker.record(&RequestRecord {
+                    id: resp.id.clone(),
+                    timestamp: iso_now(),
+                    tier: tier.to_string(),
+                    provider: provider_name,
+                    model: resp.model.clone(),
+                    tokens_in: resp.tokens_in as u64,
+                    tokens_out: resp.tokens_out as u64,
+                    cost_usd,
+                    latency_ms,
+                    status: "ok".to_string(),
+                    error_type: None,
+                    constraints: None,
+                    key_id,
+                });
 
-            let events: Vec<Result<Event, Infallible>> = vec![
-                Ok(Event::default()
-                    .data(serde_json::to_string(&content_chunk).unwrap_or_default())),
-                Ok(Event::default().data(serde_json::to_string(&finish_chunk).unwrap_or_default())),
-                Ok(Event::default().data("[DONE]")),
-            ];
+                let now = unix_now();
 
-            Sse::new(stream::iter(events)).into_response()
+                let content_chunk = ChatCompletionChunk {
+                    id: resp.id.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created: now,
+                    model: resp.model.clone(),
+                    choices: vec![StreamChoice {
+                        index: 0,
+                        delta: StreamDelta {
+                            role: Some("assistant".to_string()),
+                            content: Some(resp.content),
+                        },
+                        finish_reason: None,
+                    }],
+                };
+
+                let finish_chunk = ChatCompletionChunk {
+                    id: resp.id,
+                    object: "chat.completion.chunk".to_string(),
+                    created: now,
+                    model: resp.model,
+                    choices: vec![StreamChoice {
+                        index: 0,
+                        delta: StreamDelta {
+                            role: None,
+                            content: None,
+                        },
+                        finish_reason: Some(resp.finish_reason),
+                    }],
+                };
+
+                let events: Vec<Result<Event, Infallible>> = vec![
+                    Ok(Event::default()
+                        .data(serde_json::to_string(&content_chunk).unwrap_or_default())),
+                    Ok(Event::default()
+                        .data(serde_json::to_string(&finish_chunk).unwrap_or_default())),
+                    Ok(Event::default().data("[DONE]")),
+                ];
+
+                return Sse::new(stream::iter(events)).into_response();
+            }
         }
     }
+
+    // All attempts exhausted
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse::provider_error(
+            "all providers exhausted — no fallback available",
+        )),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

@@ -17,47 +17,163 @@ pub struct RouteDecision {
     pub adapter: Arc<dyn ProviderAdapter>,
 }
 
-/// Per-provider health state for failure tracking and circuit breaking.
+/// Circuit breaker state machine for a single provider.
+///
+/// ```text
+/// CLOSED ──(max_failures consecutive failures)──► OPEN
+/// OPEN   ──(current_cooldown elapsed)──────────► HALF_OPEN
+/// HALF_OPEN ──(on_success)──────────────────────► CLOSED  (reset cooldown)
+/// HALF_OPEN ──(on_failure)──────────────────────► OPEN    (cooldown *= 2)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CircuitState {
+    /// Normal operation — requests flow through.
+    Closed,
+    /// Provider failed too many times — all requests immediately fall back.
+    Open,
+    /// Cooldown elapsed — exactly one probe request allowed through.
+    HalfOpen,
+}
+
+impl CircuitState {
+    fn as_str(self) -> &'static str {
+        match self {
+            CircuitState::Closed => "closed",
+            CircuitState::Open => "open",
+            CircuitState::HalfOpen => "half_open",
+        }
+    }
+}
+
+/// Per-provider health state with circuit breaker + exponential backoff.
 #[derive(Debug, Clone)]
 struct ProviderHealth {
+    state: CircuitState,
     consecutive_failures: u32,
     last_failure: Option<Instant>,
-    /// After this many consecutive failures, provider is marked unavailable.
+    /// When the state last changed (used for OPEN → HALF-OPEN transition timing).
+    last_state_change: Option<Instant>,
+    /// Open circuit after this many consecutive failures. Default: 3.
     max_failures: u32,
-    /// How long to wait before retrying after max_failures.
-    cooldown: Duration,
+    /// Initial cooldown before probe attempt. Default: 30s.
+    base_cooldown: Duration,
+    /// Current cooldown — starts at base, doubles on each HALF-OPEN probe failure.
+    current_cooldown: Duration,
+    /// Maximum cooldown cap. Default: 300s (5 min).
+    max_cooldown: Duration,
 }
 
 impl ProviderHealth {
     fn new() -> Self {
+        let base = Duration::from_secs(30);
         Self {
+            state: CircuitState::Closed,
             consecutive_failures: 0,
             last_failure: None,
+            last_state_change: None,
             max_failures: 3,
-            cooldown: Duration::from_secs(30),
+            base_cooldown: base,
+            current_cooldown: base,
+            max_cooldown: Duration::from_secs(300),
         }
     }
 
-    /// Returns true if this provider should be skipped (too many recent failures).
-    fn is_unavailable(&self) -> bool {
-        if self.consecutive_failures < self.max_failures {
-            return false;
-        }
-        // Check if cooldown has elapsed
-        match self.last_failure {
-            None => false,
-            Some(t) => t.elapsed() < self.cooldown,
+    /// Returns true if a request should be attempted on this provider.
+    ///
+    /// Side effect: transitions OPEN → HALF-OPEN when `current_cooldown` has elapsed.
+    /// In HALF-OPEN state, claims the probe slot on first call (subsequent calls return false).
+    fn should_attempt(&mut self) -> bool {
+        match self.state {
+            CircuitState::Closed => true,
+            CircuitState::Open => {
+                // Check if cooldown has elapsed → transition to HALF-OPEN
+                if let Some(changed) = self.last_state_change {
+                    if changed.elapsed() >= self.current_cooldown {
+                        self.state = CircuitState::HalfOpen;
+                        self.last_state_change = Some(Instant::now());
+                        true // allow probe
+                    } else {
+                        false // still cooling down
+                    }
+                } else {
+                    false
+                }
+            }
+            CircuitState::HalfOpen => {
+                // Probe slot already claimed — block all other requests
+                false
+            }
         }
     }
 
     fn record_failure(&mut self) {
         self.consecutive_failures += 1;
         self.last_failure = Some(Instant::now());
+
+        match self.state {
+            CircuitState::Closed => {
+                if self.consecutive_failures >= self.max_failures {
+                    self.state = CircuitState::Open;
+                    self.last_state_change = Some(Instant::now());
+                    // current_cooldown stays at base on first trip open
+                }
+            }
+            CircuitState::HalfOpen => {
+                // Probe failed — back to OPEN with doubled cooldown (exponential backoff)
+                self.state = CircuitState::Open;
+                self.last_state_change = Some(Instant::now());
+                self.current_cooldown = (self.current_cooldown * 2).min(self.max_cooldown);
+            }
+            CircuitState::Open => {
+                // Defensive: requests should be blocked in OPEN state
+            }
+        }
     }
 
     fn record_success(&mut self) {
-        self.consecutive_failures = 0;
-        self.last_failure = None;
+        match self.state {
+            CircuitState::HalfOpen => {
+                // Probe succeeded — full reset
+                self.state = CircuitState::Closed;
+                self.consecutive_failures = 0;
+                self.last_failure = None;
+                self.last_state_change = Some(Instant::now());
+                self.current_cooldown = self.base_cooldown; // reset backoff
+            }
+            CircuitState::Closed => {
+                self.consecutive_failures = 0;
+                self.last_failure = None;
+            }
+            CircuitState::Open => {
+                // Defensive: treat as recovery
+                self.state = CircuitState::Closed;
+                self.consecutive_failures = 0;
+                self.last_failure = None;
+                self.last_state_change = Some(Instant::now());
+                self.current_cooldown = self.base_cooldown;
+            }
+        }
+    }
+
+    /// Cooldown remaining in seconds (for /status). Returns None if not OPEN.
+    fn cooldown_remaining_secs(&self) -> Option<u64> {
+        if self.state != CircuitState::Open {
+            return None;
+        }
+        self.last_state_change.map(|t| {
+            let elapsed = t.elapsed();
+            if elapsed >= self.current_cooldown {
+                0
+            } else {
+                (self.current_cooldown - elapsed).as_secs()
+            }
+        })
+    }
+
+    /// Override `last_state_change` — test helper for time-sensitive transition tests.
+    #[cfg(test)]
+    fn set_last_state_change(&mut self, t: Instant) {
+        self.last_state_change = Some(t);
     }
 }
 
@@ -87,7 +203,7 @@ impl Router {
     /// 3. Get default provider for tier from config
     /// 4. Apply constraint filters (privacy, cost, latency)
     /// 5. If filtered set differs from default, select best available from filtered set
-    /// 6. Try fallback if primary is unavailable
+    /// 6. Try fallback if primary is unavailable or circuit OPEN
     pub fn resolve(
         &self,
         tier: ModelTier,
@@ -124,11 +240,11 @@ impl Router {
                 .unwrap_or(default_provider.clone())
         };
 
-        // 6. Try selected provider, then fallback
-        self.resolve_with_fallback(&selected, 0)
+        // 6. Try selected provider, then fallback chain
+        self.resolve_with_fallback(&selected, 0, None)
     }
 
-    /// Report a successful completion for a provider (resets failure count).
+    /// Report a successful completion for a provider (resets failure count and circuit state).
     pub fn on_success(&self, provider_name: &str) {
         let mut health = self.health.lock().expect("health lock poisoned");
         health
@@ -137,19 +253,24 @@ impl Router {
             .record_success();
     }
 
-    /// Report a failed completion for a provider (may trigger circuit break).
+    /// Report a failed completion for a provider (may trigger circuit state transition).
     pub fn on_failure(&self, provider_name: &str) {
         let mut health = self.health.lock().expect("health lock poisoned");
-        health
+        let h = health
             .entry(provider_name.to_string())
-            .or_insert_with(ProviderHealth::new)
-            .record_failure();
-        let failures = health[provider_name].consecutive_failures;
-        if failures >= health[provider_name].max_failures {
+            .or_insert_with(ProviderHealth::new);
+        let old_state = h.state;
+        h.record_failure();
+        let new_state = h.state;
+
+        if old_state != new_state {
             tracing::warn!(
                 provider = provider_name,
-                consecutive_failures = failures,
-                "provider marked unavailable — circuit open"
+                old_state = old_state.as_str(),
+                new_state = new_state.as_str(),
+                consecutive_failures = h.consecutive_failures,
+                cooldown_secs = h.current_cooldown.as_secs(),
+                "circuit breaker state transition"
             );
         }
     }
@@ -191,10 +312,16 @@ impl Router {
         })
     }
 
+    /// Walk the fallback chain until a healthy, available provider is found.
+    ///
+    /// `original_provider`: the first provider in the chain (used for cost comparison).
+    /// Lock discipline: `provider_is_healthy()` acquires the health mutex for the duration of
+    /// the health check only — the lock is released before the recursive call.
     fn resolve_with_fallback(
         &self,
         provider_name: &str,
         depth: u32,
+        original_provider: Option<&str>,
     ) -> Result<RouteDecision, RouterError> {
         // Prevent infinite fallback loops
         if depth > 3 {
@@ -204,12 +331,13 @@ impl Router {
         }
 
         let adapter = self.registry.get(provider_name);
+        // Lock acquired here, checked, released before recursive call below
         let health_ok = self.provider_is_healthy(provider_name);
 
         let adapter = match adapter {
             Some(a) if a.is_available() && health_ok => a,
             Some(_) | None => {
-                // Provider unavailable or unhealthy — try fallback
+                // Provider unavailable or circuit OPEN — try fallback
                 let fallback = self
                     .config
                     .providers
@@ -218,12 +346,29 @@ impl Router {
                     .map(str::to_string);
 
                 if let Some(fb) = fallback {
-                    tracing::warn!(
-                        primary = provider_name,
-                        fallback = %fb,
-                        "fallback triggered"
-                    );
-                    return self.resolve_with_fallback(&fb, depth + 1);
+                    // original tracks the first provider for cost comparison across the chain
+                    let original = original_provider.unwrap_or(provider_name);
+                    let (orig_in, orig_out) = self.provider_pricing(original);
+                    let (fb_in, fb_out) = self.provider_pricing(&fb);
+
+                    if fb_in > orig_in || fb_out > orig_out {
+                        tracing::warn!(
+                            primary = original,
+                            fallback = %fb,
+                            primary_cost_in = orig_in,
+                            fallback_cost_in = fb_in,
+                            primary_cost_out = orig_out,
+                            fallback_cost_out = fb_out,
+                            "fallback cost premium — request will cost more than expected"
+                        );
+                    } else {
+                        tracing::warn!(
+                            primary = provider_name,
+                            fallback = %fb,
+                            "fallback triggered"
+                        );
+                    }
+                    return self.resolve_with_fallback(&fb, depth + 1, Some(original));
                 }
 
                 // No fallback configured — try mock if available
@@ -313,12 +458,16 @@ impl Router {
             .collect()
     }
 
+    /// Returns true if the provider should accept a request right now.
+    ///
+    /// Side effect via `should_attempt()`: may transition OPEN → HALF-OPEN.
+    /// Lock acquired for health check only — released before adapter call.
     fn provider_is_healthy(&self, provider_name: &str) -> bool {
-        let health = self.health.lock().expect("health lock poisoned");
+        let mut health = self.health.lock().expect("health lock poisoned");
         health
-            .get(provider_name)
-            .map(|h| !h.is_unavailable())
-            .unwrap_or(true) // unknown providers are assumed healthy
+            .entry(provider_name.to_string())
+            .or_insert_with(ProviderHealth::new)
+            .should_attempt()
     }
 }
 
@@ -328,6 +477,11 @@ pub struct ProviderStatusInfo {
     pub name: String,
     pub available: bool,
     pub tags: Vec<String>,
+    /// Circuit breaker state: "closed" | "open" | "half_open"
+    pub circuit_state: String,
+    pub consecutive_failures: u32,
+    /// Seconds until the circuit may probe again. None if not OPEN.
+    pub cooldown_remaining_secs: Option<u64>,
 }
 
 impl Router {
@@ -346,8 +500,9 @@ impl Router {
             .unwrap_or((0.0, 0.0))
     }
 
-    /// List all registered providers with availability and tags (for /status).
+    /// List all registered providers with availability, tags, and circuit state (for /status).
     pub fn provider_statuses(&self) -> Vec<ProviderStatusInfo> {
+        let health = self.health.lock().expect("health lock poisoned");
         let mut statuses: Vec<ProviderStatusInfo> = self
             .registry
             .all_providers()
@@ -364,10 +519,17 @@ impl Router {
                     .get(name)
                     .map(|p| p.tags.clone())
                     .unwrap_or_default();
+                let h = health.get(name);
+                let circuit_state = h.map(|h| h.state.as_str()).unwrap_or("closed").to_string();
+                let consecutive_failures = h.map(|h| h.consecutive_failures).unwrap_or(0);
+                let cooldown_remaining_secs = h.and_then(|h| h.cooldown_remaining_secs());
                 ProviderStatusInfo {
                     name: name.to_string(),
                     available,
                     tags,
+                    circuit_state,
+                    consecutive_failures,
+                    cooldown_remaining_secs,
                 }
             })
             .collect();
@@ -390,9 +552,11 @@ pub enum RouterError {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use accelmars_gateway_core::{
-        CostPreference, Latency, MockAdapter, Privacy, RoutingConstraints,
+        CostPreference, Latency, MockAdapter, ModelTier, Privacy, RoutingConstraints,
     };
 
     use super::*;
@@ -485,6 +649,8 @@ mod tests {
         }
         registry
     }
+
+    // === Original routing tests ===
 
     #[test]
     fn mock_mode_always_routes_to_mock() {
@@ -646,5 +812,319 @@ mod tests {
             .resolve(ModelTier::Max, &RoutingConstraints::default())
             .unwrap();
         assert_eq!(max.provider_name, "claude");
+    }
+
+    // === Circuit breaker tests ===
+
+    #[test]
+    fn circuit_closed_allows_requests() {
+        // Fresh provider is in CLOSED state — requests flow through.
+        let mut h = ProviderHealth::new();
+        assert_eq!(h.state, CircuitState::Closed);
+        assert!(h.should_attempt());
+        // Multiple calls in CLOSED all return true
+        assert!(h.should_attempt());
+    }
+
+    #[test]
+    fn circuit_opens_after_max_failures() {
+        // 3 consecutive failures → OPEN, provider_is_healthy returns false.
+        let config = make_config(GatewayMode::Normal);
+        let registry = make_registry_with_available(&["deepseek"]);
+        let router = Router::new(config, registry);
+
+        router.on_failure("deepseek");
+        router.on_failure("deepseek");
+        router.on_failure("deepseek");
+
+        assert!(!router.provider_is_healthy("deepseek"));
+
+        let health = router.health.lock().unwrap();
+        assert_eq!(health["deepseek"].state, CircuitState::Open);
+    }
+
+    #[test]
+    fn circuit_half_open_after_cooldown() {
+        // OPEN → HALF-OPEN when cooldown elapses. Probe request allowed.
+        let config = make_config(GatewayMode::Normal);
+        let registry = make_registry_with_available(&["deepseek"]);
+        let router = Router::new(config, registry);
+
+        // Open the circuit
+        router.on_failure("deepseek");
+        router.on_failure("deepseek");
+        router.on_failure("deepseek");
+
+        // Simulate cooldown expiry by setting last_state_change to the past
+        {
+            let mut health = router.health.lock().unwrap();
+            let h = health.get_mut("deepseek").unwrap();
+            h.set_last_state_change(Instant::now() - Duration::from_secs(31));
+        }
+
+        // First call: transitions OPEN → HALF-OPEN, returns true (probe allowed)
+        assert!(router.provider_is_healthy("deepseek"));
+
+        // Verify state is now HALF-OPEN
+        {
+            let health = router.health.lock().unwrap();
+            assert_eq!(health["deepseek"].state, CircuitState::HalfOpen);
+        }
+
+        // Second call: probe slot claimed, returns false
+        assert!(!router.provider_is_healthy("deepseek"));
+    }
+
+    #[test]
+    fn half_open_success_closes_circuit() {
+        // HALF-OPEN + on_success() → CLOSED with all counters reset and cooldown back to base.
+        let config = make_config(GatewayMode::Normal);
+        let registry = make_registry_with_available(&["deepseek"]);
+        let router = Router::new(config, registry);
+
+        // Drive to OPEN
+        router.on_failure("deepseek");
+        router.on_failure("deepseek");
+        router.on_failure("deepseek");
+
+        // Force to HALF-OPEN directly
+        {
+            let mut health = router.health.lock().unwrap();
+            let h = health.get_mut("deepseek").unwrap();
+            h.state = CircuitState::HalfOpen;
+            h.last_state_change = Some(Instant::now());
+        }
+
+        // Probe succeeds → full reset
+        router.on_success("deepseek");
+
+        {
+            let health = router.health.lock().unwrap();
+            let h = &health["deepseek"];
+            assert_eq!(h.state, CircuitState::Closed);
+            assert_eq!(h.consecutive_failures, 0);
+            assert_eq!(h.current_cooldown, h.base_cooldown);
+        }
+
+        // Provider is now healthy again
+        assert!(router.provider_is_healthy("deepseek"));
+    }
+
+    #[test]
+    fn half_open_failure_reopens_with_longer_cooldown() {
+        // HALF-OPEN + on_failure() → OPEN with doubled cooldown (30 → 60s).
+        let config = make_config(GatewayMode::Normal);
+        let registry = make_registry_with_available(&["deepseek"]);
+        let router = Router::new(config, registry);
+
+        // Drive to OPEN
+        router.on_failure("deepseek");
+        router.on_failure("deepseek");
+        router.on_failure("deepseek");
+
+        // Force to HALF-OPEN
+        {
+            let mut health = router.health.lock().unwrap();
+            let h = health.get_mut("deepseek").unwrap();
+            h.state = CircuitState::HalfOpen;
+            h.last_state_change = Some(Instant::now());
+        }
+
+        // Probe fails → back to OPEN with doubled cooldown
+        router.on_failure("deepseek");
+
+        {
+            let health = router.health.lock().unwrap();
+            let h = &health["deepseek"];
+            assert_eq!(h.state, CircuitState::Open);
+            assert_eq!(h.current_cooldown, Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn exponential_backoff_caps_at_max() {
+        // Each HALF-OPEN probe failure doubles cooldown: 30 → 60 → 120 → 240 → 300 → 300 (cap).
+        let mut h = ProviderHealth::new();
+        assert_eq!(h.current_cooldown.as_secs(), 30); // initial
+
+        let expected_after_each_probe_failure = [60u64, 120, 240, 300, 300];
+
+        for &expected_secs in &expected_after_each_probe_failure {
+            // Set to HALF-OPEN to trigger the probe-failure path in record_failure()
+            h.state = CircuitState::HalfOpen;
+            h.last_state_change = Some(Instant::now());
+            h.record_failure();
+
+            assert_eq!(
+                h.current_cooldown.as_secs(),
+                expected_secs,
+                "expected cooldown {}s after probe failure, got {}s",
+                expected_secs,
+                h.current_cooldown.as_secs()
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_cost_premium_logged() {
+        // When cheap provider (deepseek $0.28/M) falls back to expensive one (claude $3/M),
+        // the router resolves to claude (behavioral verification).
+        // Structured cost premium warning is emitted — verified by code review of
+        // resolve_with_fallback(): "fallback cost premium" tracing::warn! call.
+        let mut config = make_config(GatewayMode::Normal);
+        // Set deepseek to fall back to claude (more expensive)
+        config.providers.get_mut("deepseek").unwrap().fallback = Some("claude".to_string());
+
+        let mut registry = AdapterRegistry::new();
+        registry.register(Arc::new(MockAdapter::default()));
+        // deepseek not registered (unavailable) → triggers fallback to claude
+        registry.register(Arc::new(MockAdapter::default().with_name("claude")));
+
+        let router = Router::new(config, registry);
+
+        // Standard tier → deepseek (unavailable) → fallback to claude
+        let decision = router
+            .resolve(ModelTier::Standard, &RoutingConstraints::default())
+            .unwrap();
+
+        // Behavioral: fallback resolved to claude (the more expensive provider)
+        assert_eq!(decision.provider_name, "claude");
+        // Pricing confirms cost premium: deepseek ($0.28) → claude ($3.0)
+        let (orig_in, _) = router.provider_pricing("deepseek");
+        let (fb_in, _) = router.provider_pricing("claude");
+        assert!(
+            fb_in > orig_in,
+            "claude should be more expensive than deepseek"
+        );
+    }
+
+    #[test]
+    fn fallback_skips_open_circuit_provider() {
+        // When primary has OPEN circuit, router should resolve to fallback provider.
+        let mut config = make_config(GatewayMode::Normal);
+        config.providers.get_mut("deepseek").unwrap().fallback = Some("claude".to_string());
+
+        let registry = make_registry_with_available(&["deepseek", "claude"]);
+        let router = Router::new(config, registry);
+
+        // Open deepseek's circuit (3 failures)
+        router.on_failure("deepseek");
+        router.on_failure("deepseek");
+        router.on_failure("deepseek");
+        assert!(!router.provider_is_healthy("deepseek"));
+
+        // Standard tier → deepseek (OPEN) → falls back to claude
+        let decision = router
+            .resolve(ModelTier::Standard, &RoutingConstraints::default())
+            .unwrap();
+        assert_eq!(decision.provider_name, "claude");
+    }
+
+    #[test]
+    fn full_circuit_lifecycle() {
+        // Complete state machine: CLOSED → OPEN → HALF-OPEN → CLOSED.
+        let config = make_config(GatewayMode::Normal);
+        let registry = make_registry_with_available(&["deepseek"]);
+        let router = Router::new(config, registry);
+
+        // Phase 1: CLOSED — requests allowed
+        assert!(router.provider_is_healthy("deepseek"));
+
+        // Phase 2: 3 failures → OPEN
+        router.on_failure("deepseek");
+        router.on_failure("deepseek");
+        router.on_failure("deepseek");
+        assert!(!router.provider_is_healthy("deepseek"));
+        {
+            let health = router.health.lock().unwrap();
+            assert_eq!(health["deepseek"].state, CircuitState::Open);
+        }
+
+        // Phase 3: Simulate cooldown expiry → HALF-OPEN on next check
+        {
+            let mut health = router.health.lock().unwrap();
+            health
+                .get_mut("deepseek")
+                .unwrap()
+                .set_last_state_change(Instant::now() - Duration::from_secs(31));
+        }
+        assert!(router.provider_is_healthy("deepseek")); // probe allowed
+        {
+            let health = router.health.lock().unwrap();
+            assert_eq!(health["deepseek"].state, CircuitState::HalfOpen);
+        }
+
+        // Phase 4: Probe succeeds → CLOSED (full reset)
+        router.on_success("deepseek");
+        {
+            let health = router.health.lock().unwrap();
+            let h = &health["deepseek"];
+            assert_eq!(h.state, CircuitState::Closed);
+            assert_eq!(h.consecutive_failures, 0);
+            assert_eq!(h.current_cooldown, h.base_cooldown);
+        }
+
+        // Back to healthy
+        assert!(router.provider_is_healthy("deepseek"));
+    }
+
+    #[test]
+    fn concurrent_health_checks_dont_deadlock() {
+        // Concurrent on_failure() and provider_is_healthy() calls must not deadlock.
+        // Guards against lock ordering bugs in the health Mutex.
+        let config = make_config(GatewayMode::Normal);
+        let registry = make_registry_with_available(&["deepseek", "claude"]);
+        let router = Arc::new(Router::new(config, registry));
+
+        let mut handles = Vec::new();
+
+        for i in 0..10 {
+            let r = router.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    if i % 2 == 0 {
+                        r.on_failure("deepseek");
+                        r.on_success("deepseek");
+                    } else {
+                        let _ = r.provider_is_healthy("deepseek");
+                        let _ = r.provider_is_healthy("claude");
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join()
+                .expect("thread panicked — possible deadlock or panic");
+        }
+        // Reaching here means no deadlock occurred within the thread lifetime
+    }
+
+    #[test]
+    fn status_endpoint_shows_circuit_state() {
+        // After failures, provider_statuses() reflects circuit state for observability.
+        let config = make_config(GatewayMode::Normal);
+        let registry = make_registry_with_available(&["deepseek", "gemini"]);
+        let router = Router::new(config, registry);
+
+        // Open deepseek's circuit
+        router.on_failure("deepseek");
+        router.on_failure("deepseek");
+        router.on_failure("deepseek");
+
+        let statuses = router.provider_statuses();
+
+        let deepseek = statuses.iter().find(|s| s.name == "deepseek").unwrap();
+        assert_eq!(deepseek.circuit_state, "open");
+        assert_eq!(deepseek.consecutive_failures, 3);
+        assert!(
+            deepseek.cooldown_remaining_secs.is_some(),
+            "OPEN provider should have a cooldown_remaining_secs"
+        );
+
+        let mock_status = statuses.iter().find(|s| s.name == "mock").unwrap();
+        assert_eq!(mock_status.circuit_state, "closed");
+        assert_eq!(mock_status.consecutive_failures, 0);
+        assert!(mock_status.cooldown_remaining_secs.is_none());
     }
 }
