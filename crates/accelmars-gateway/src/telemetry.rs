@@ -9,6 +9,8 @@
 
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::KeyValue;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::WithHttpConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use tracing_subscriber::layer::SubscriberExt;
@@ -96,11 +98,19 @@ pub fn init_tracing(log_level: &str) -> Option<SdkTracerProvider> {
 
 /// Build the OTel tracer provider with OTLP HTTP exporter and service resource.
 ///
-/// Reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_HEADERS` from
-/// environment (standard OTel env vars — no hardcoded URLs).
+/// Explicitly reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_HEADERS`
+/// and passes them to the builder — the default builder does not auto-read env vars.
 fn build_tracer_provider() -> Result<SdkTracerProvider, Box<dyn std::error::Error>> {
+    let base = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .unwrap_or_else(|_| "http://localhost:4318".to_string());
+    let endpoint = format!("{}/v1/traces", base.trim_end_matches('/'));
+
+    let headers = parse_otlp_headers(std::env::var("OTEL_EXPORTER_OTLP_HEADERS").ok().as_deref());
+
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
+        .with_endpoint(endpoint)
+        .with_headers(headers)
         .build()?;
 
     let provider = SdkTracerProvider::builder()
@@ -135,6 +145,20 @@ pub fn provider_to_system(provider: &str) -> &'static str {
     } else {
         "unknown"
     }
+}
+
+/// Parse `OTEL_EXPORTER_OTLP_HEADERS` — comma-separated `key=value` pairs.
+/// Values may contain `=` (e.g. Base64-encoded auth tokens); `split_once` is safe.
+fn parse_otlp_headers(raw: Option<&str>) -> std::collections::HashMap<String, String> {
+    let mut headers = std::collections::HashMap::new();
+    if let Some(h) = raw {
+        for pair in h.split(',') {
+            if let Some((k, v)) = pair.split_once('=') {
+                headers.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+    }
+    headers
 }
 
 /// Flush buffered spans and shut down the OTel provider.
