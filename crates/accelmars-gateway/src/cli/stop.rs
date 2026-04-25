@@ -21,7 +21,7 @@ pub fn run(port_override: Option<u16>) -> i32 {
                     "error: no running gateway found (no PID file at {}).",
                     pid::default_path().display()
                 );
-                eprintln!("Tip: start with `gateway serve`");
+                eprintln!("Tip: start with `gateway start`");
             }
             return 1;
         }
@@ -61,7 +61,10 @@ pub fn run(port_override: Option<u16>) -> i32 {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         if !pid::is_alive(pid_info.pid) {
-            println!("Gateway stopped (was running on port {}).", pid_info.port);
+            eprintln!(
+                "Gateway stopped (was running on port {}). Run 'gateway start' to restart.",
+                pid_info.port
+            );
             // Server's shutdown handler cleans up PID file; remove stale file if still present.
             pid::cleanup();
             return 0;

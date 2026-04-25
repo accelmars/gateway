@@ -769,9 +769,14 @@ async fn status_cli_returns_exit_0_when_server_running() {
         .parse()
         .expect("port should parse");
 
-    let exit_code = status_run(port, PortSource::Flag, false)
-        .await
-        .expect("status should not return Err when server is running");
+    let exit_code = status_run(
+        port,
+        PortSource::Flag,
+        false,
+        accelmars_gateway_core::OutputConfig::from_env(true),
+    )
+    .await
+    .expect("status should not return Err when server is running");
 
     assert_eq!(exit_code, 0, "exit 0 expected when server is running");
 }
@@ -792,9 +797,14 @@ async fn status_cli_returns_exit_1_when_server_not_running() {
     // Brief yield so OS can reclaim the port
     tokio::task::yield_now().await;
 
-    let exit_code = status_run(port, PortSource::Flag, false)
-        .await
-        .expect("status should return Ok(1), not Err, when server is not running");
+    let exit_code = status_run(
+        port,
+        PortSource::Flag,
+        false,
+        accelmars_gateway_core::OutputConfig::from_env(true),
+    )
+    .await
+    .expect("status should return Ok(1), not Err, when server is not running");
 
     assert_eq!(exit_code, 1, "exit 1 expected when server is not running");
 }
@@ -811,9 +821,14 @@ async fn status_cli_json_mode_returns_running_true() {
     let port: u16 = base.split(':').last().unwrap().parse().unwrap();
 
     // Run with json_output=true — output goes to stdout but we verify exit code
-    let exit_code = status_run(port, PortSource::PidFile, true)
-        .await
-        .expect("status --json should not Err when server is running");
+    let exit_code = status_run(
+        port,
+        PortSource::PidFile,
+        true,
+        accelmars_gateway_core::OutputConfig::from_env(true),
+    )
+    .await
+    .expect("status --json should not Err when server is running");
 
     assert_eq!(
         exit_code, 0,
