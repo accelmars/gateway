@@ -12,6 +12,9 @@ pub use types::{
 pub mod suggest;
 pub use suggest::suggest_similar;
 
+pub mod output;
+pub use output::OutputConfig;
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
