@@ -29,17 +29,50 @@ pub async fn run(
     constraints_in: &CompleteConstraints,
 ) -> anyhow::Result<()> {
     let registry = build_registry(config);
+    // Collect provider names before registry is consumed by Router::new
+    let provider_names: Vec<String> = registry
+        .all_providers()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let router = Arc::new(Router::new(config.clone(), registry));
 
     let constraints = parse_constraints(constraints_in);
 
-    let decision = router
-        .resolve(tier, &constraints)
-        .map_err(|e| anyhow::anyhow!("routing failed: {e}"))?;
+    let decision = match router.resolve(tier, &constraints) {
+        Ok(d) => d,
+        Err(e) => {
+            if let Some(ref provider_name) = constraints_in.provider {
+                // C1: fuzzy suggestion for unknown provider name
+                let provider_strs: Vec<&str> = provider_names.iter().map(|s| s.as_str()).collect();
+                let suggestions =
+                    accelmars_gateway_core::suggest_similar(provider_name, &provider_strs, 0.6);
+                eprintln!("Error: Unknown provider '{provider_name}'.");
+                if let Some(suggestion) = suggestions.first() {
+                    eprintln!(
+                        "Did you mean: gateway complete \"...\" --provider {}?",
+                        suggestion
+                    );
+                }
+            } else {
+                // U2: routing failure message
+                eprintln!(
+                    "Error: No provider available for tier '{}' — {}. Try --tier standard or check: gateway status",
+                    tier, e
+                );
+            }
+            std::process::exit(1);
+        }
+    };
 
     let provider_name = decision.provider_name.clone();
     let model_id = decision.model_id.clone();
     let adapter = decision.adapter;
+
+    // C5: progress indicator on stderr before the (slow) network call
+    if !json_output {
+        eprintln!("Routing to {} ({} tier)…", provider_name, tier);
+    }
 
     let gateway_req = GatewayRequest {
         tier,

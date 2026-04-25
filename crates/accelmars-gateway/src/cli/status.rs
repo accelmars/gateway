@@ -24,7 +24,12 @@ impl PortSource {
 /// - `0` — server is running and healthy (HTTP 200 from /status)
 /// - `1` — server is not running, or returned non-200
 /// - `Err(_)` — system error (network failure, DNS resolution failure) → caller exits 2
-pub async fn run(port: u16, source: PortSource, json_output: bool) -> anyhow::Result<i32> {
+pub async fn run(
+    port: u16,
+    source: PortSource,
+    json_output: bool,
+    output_config: accelmars_gateway_core::OutputConfig,
+) -> anyhow::Result<i32> {
     let url = format!("http://127.0.0.1:{port}/status");
 
     let resp = match reqwest::get(&url).await {
@@ -50,11 +55,8 @@ pub async fn run(port: u16, source: PortSource, json_output: bool) -> anyhow::Re
             });
             println!("{}", serde_json::to_string_pretty(&obj)?);
         } else {
-            println!("AccelMars Gateway");
-            println!();
-            println!(
-                "Server:      unhealthy (port {port}, HTTP {})",
-                resp.status().as_u16()
+            eprintln!(
+                "Gateway is not responding on port {port}. Check if it's running: gateway start"
             );
         }
         return Ok(1);
@@ -110,19 +112,30 @@ pub async fn run(port: u16, source: PortSource, json_output: bool) -> anyhow::Re
                 .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
 
-            let icon = if avail { "✓" } else { "✗" };
+            let icon = if avail {
+                output_config.colorize("✓", "\x1b[32m", "\x1b[0m")
+            } else {
+                output_config.colorize("✗", "\x1b[31m", "\x1b[0m")
+            };
             let tag_str = if tags.is_empty() {
                 String::new()
             } else {
                 format!(" ({})", tags.join(", "))
             };
-            let avail_str = if avail { "available" } else { "unavailable" };
+            let avail_str = if avail {
+                output_config.colorize("available", "\x1b[32m", "\x1b[0m")
+            } else {
+                output_config.colorize("unavailable", "\x1b[31m", "\x1b[0m")
+            };
             println!("  {icon} {name:<24}{avail_str}{tag_str}");
         }
 
         println!();
         println!("  Total: {available_count}/{total} available");
     }
+
+    println!();
+    println!("Run 'gateway stats' for usage or 'gateway complete \"<prompt>\"' to test.");
 
     Ok(0)
 }
@@ -136,13 +149,7 @@ fn emit_not_running(port: u16, source: PortSource, json_output: bool) -> anyhow:
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
-        println!("AccelMars Gateway");
-        println!();
-        println!(
-            "Server:      not running (checked port {port} via {})",
-            source.as_str()
-        );
-        println!("Tip: start with `gateway serve`");
+        eprintln!("Gateway is not responding on port {port}. Check if it's running: gateway start");
     }
     Ok(())
 }

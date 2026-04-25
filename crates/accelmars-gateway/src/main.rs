@@ -37,17 +37,18 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start the gateway HTTP server (OpenAI-compatible API)
-    Serve {
+    #[command(alias = "serve")]
+    Start {
         /// Port to listen on (overrides config file and GATEWAY__PORT)
         #[arg(long, env = "GATEWAY_PORT")]
         port: Option<u16>,
-        /// Path to config file (default: gateway.toml in CWD)
+        /// Path to config file (default: ./gateway.toml)
         #[arg(long)]
         config: Option<std::path::PathBuf>,
     },
     /// Show gateway health and provider availability
     Status {
-        /// Port the server is listening on (overrides PID file and config)
+        /// Port to query (default: auto-discovered from PID file, then config, then 8080)
         #[arg(long)]
         port: Option<u16>,
         /// Path to config file (to read port default)
@@ -56,10 +57,13 @@ enum Commands {
         /// Output JSON instead of human-readable text
         #[arg(long)]
         json: bool,
+        /// Disable ANSI color codes in output (also respects NO_COLOR env var)
+        #[arg(long)]
+        no_color: bool,
     },
     /// Show cost summary and call statistics
     Stats {
-        /// Filter to calls on or after this date (YYYY-MM-DD)
+        /// Filter to calls on or after this date (YYYY-MM-DD, e.g., 2026-04-01)
         #[arg(long)]
         since: Option<String>,
         /// Output JSON instead of human-readable text
@@ -71,6 +75,9 @@ enum Commands {
         /// Filter by tier (quick, standard, max, ultra)
         #[arg(long)]
         tier: Option<String>,
+        /// Disable ANSI color codes in output (also respects NO_COLOR env var)
+        #[arg(long)]
+        no_color: bool,
     },
     /// Execute a single completion (one-shot mode, no server needed)
     Complete {
@@ -85,13 +92,13 @@ enum Commands {
         /// Path to config file (default: gateway.toml in CWD)
         #[arg(long)]
         config: Option<std::path::PathBuf>,
-        /// Privacy constraint: open | sensitive | private
+        /// Privacy constraint: open | sensitive | private (default: open)
         #[arg(long)]
         privacy: Option<String>,
-        /// Cost constraint: free | budget | default | unlimited
+        /// Cost constraint: free | budget | default | unlimited (default: default)
         #[arg(long)]
         cost: Option<String>,
-        /// Latency constraint: normal | low
+        /// Latency constraint: normal | low (default: normal)
         #[arg(long)]
         latency: Option<String>,
         /// Explicit provider override (bypasses tier routing)
@@ -124,11 +131,20 @@ enum KeysAction {
         /// Output JSON instead of table
         #[arg(long)]
         json: bool,
+        /// Disable ANSI color codes in output (also respects NO_COLOR env var)
+        #[arg(long)]
+        no_color: bool,
     },
     /// Revoke an API key by prefix (e.g., gw_live_a8f2)
     Revoke {
-        /// Key prefix shown in `gateway keys list`
+        /// Key prefix from 'gateway keys list' (e.g., gw_live_a8f2)
         prefix: String,
+        /// Preview what would be revoked without revoking (dry run)
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip confirmation prompt (for scripting)
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -185,12 +201,13 @@ async fn main() {
     let tracer_provider = accelmars_gateway::telemetry::init_tracing(&cli.log_level);
 
     match cli.command {
-        Some(Commands::Serve { port, config }) => {
+        Some(Commands::Start { port, config }) => {
             let config_path = config.as_deref();
             let mut gateway_config = match GatewayConfig::load(config_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::error!("failed to load config: {e:#}");
+                    eprintln!("Error: failed to load config — {e:#}");
+                    eprintln!("Run with --config <path> to specify a config file, or create gateway.toml in the current directory.");
                     std::process::exit(1);
                 }
             };
@@ -206,7 +223,8 @@ async fn main() {
                     }
                 }
                 Err(e) => {
-                    tracing::error!("config validation failed: {e:#}");
+                    eprintln!("Error: config validation failed — {e:#}");
+                    eprintln!("Check gateway.toml or run with --config <path> to specify a different file.");
                     std::process::exit(1);
                 }
             }
@@ -240,9 +258,8 @@ async fn main() {
             if let Some(existing) = pid::read() {
                 if pid::is_alive(existing.pid) {
                     eprintln!(
-                        "error: Gateway already running on port {} (pid {}). \
-                        Use `gateway status --port {}` to check.",
-                        existing.port, existing.pid, existing.port
+                        "Error: Gateway already running on port {} (PID {}). Stop it with: gateway stop",
+                        existing.port, existing.pid
                     );
                     std::process::exit(1);
                 } else {
@@ -267,6 +284,10 @@ async fn main() {
                     port = serve_port,
                     path = %pid::default_path().display(),
                     "PID file written"
+                );
+                eprintln!(
+                    "Gateway running on port {}. Run 'gateway status' to check health or 'gateway stop' to stop.",
+                    serve_port
                 );
             }
 
@@ -311,7 +332,12 @@ async fn main() {
             pid::cleanup();
         }
 
-        Some(Commands::Status { port, config, json }) => {
+        Some(Commands::Status {
+            port,
+            config,
+            json,
+            no_color,
+        }) => {
             // Port resolution order:
             // 1. --port flag (highest priority)
             // 2. PID file port (auto-discovery)
@@ -331,7 +357,8 @@ async fn main() {
                 }
             };
 
-            match cli::status::run(resolved_port, source, json).await {
+            let output_config = accelmars_gateway_core::OutputConfig::from_env(no_color);
+            match cli::status::run(resolved_port, source, json, output_config).await {
                 Ok(exit_code) => std::process::exit(exit_code),
                 Err(e) => {
                     eprintln!("error: {e:#}");
@@ -345,10 +372,16 @@ async fn main() {
             json,
             provider,
             tier,
+            no_color,
         }) => {
-            if let Err(e) =
-                cli::stats::run(since.as_deref(), json, provider.as_deref(), tier.as_deref())
-            {
+            let output_config = accelmars_gateway_core::OutputConfig::from_env(no_color);
+            if let Err(e) = cli::stats::run(
+                since.as_deref(),
+                json,
+                provider.as_deref(),
+                tier.as_deref(),
+                output_config,
+            ) {
                 eprintln!("error: {e:#}");
                 std::process::exit(1);
             }
@@ -392,7 +425,7 @@ async fn main() {
                 cli::complete::run(&gateway_config, model_tier, &prompt, json, &constraints).await
             {
                 eprintln!("error: {e:#}");
-                std::process::exit(1);
+                std::process::exit(2);
             }
         }
 
@@ -414,11 +447,16 @@ async fn main() {
                 KeysAction::Create { name } => {
                     cli::keys::create(&auth_store, &name);
                 }
-                KeysAction::List { json } => {
-                    cli::keys::list(&auth_store, json);
+                KeysAction::List { json, no_color } => {
+                    let output_config = accelmars_gateway_core::OutputConfig::from_env(no_color);
+                    cli::keys::list(&auth_store, json, output_config);
                 }
-                KeysAction::Revoke { prefix } => {
-                    let exit_code = cli::keys::revoke(&auth_store, &prefix);
+                KeysAction::Revoke {
+                    prefix,
+                    dry_run,
+                    yes,
+                } => {
+                    let exit_code = cli::keys::revoke(&auth_store, &prefix, dry_run, yes);
                     std::process::exit(exit_code);
                 }
             }

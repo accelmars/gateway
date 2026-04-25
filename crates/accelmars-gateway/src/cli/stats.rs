@@ -6,7 +6,26 @@ pub fn run(
     json_output: bool,
     provider_filter: Option<&str>,
     tier_filter: Option<&str>,
+    _output_config: accelmars_gateway_core::OutputConfig,
 ) -> anyhow::Result<()> {
+    // U2 + C9: validate --since date format (YYYY-MM-DD) before any DB query
+    if let Some(since_str) = since {
+        let parts: Vec<&str> = since_str.split('-').collect();
+        let valid = since_str.len() == 10
+            && parts.len() == 3
+            && parts[0].len() == 4
+            && parts[1].len() == 2
+            && parts[2].len() == 2
+            && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()));
+        if !valid {
+            eprintln!(
+                "Error: '--since {}' is not a valid date — use YYYY-MM-DD (e.g., --since 2026-04-01).",
+                since_str
+            );
+            std::process::exit(1);
+        }
+    }
+
     let db_path = CostTracker::default_path();
 
     if !db_path.exists() {
@@ -39,10 +58,11 @@ pub fn run(
         .filter(|t| tier_filter.is_none_or(|f| t.tier == f))
         .collect();
 
-    // Determine if filters were applied and produced empty results
-    let filters_applied = provider_filter.is_some() || tier_filter.is_some();
-    let no_matching_records =
-        filters_applied && by_provider.is_empty() && by_tier.is_empty() && summary.total_calls > 0;
+    // C3: determine zero-result condition per active filter
+    let provider_no_match = provider_filter.is_some() && by_provider.is_empty();
+    let tier_no_match = tier_filter.is_some() && by_tier.is_empty();
+    let since_no_match = since.is_some() && summary.total_calls == 0;
+    let no_matching_records = provider_no_match || tier_no_match || since_no_match;
 
     if json_output {
         if no_matching_records {
@@ -52,6 +72,9 @@ pub fn run(
             }
             if let Some(t) = tier_filter {
                 filters.insert("tier".to_string(), serde_json::json!(t));
+            }
+            if let Some(s) = since {
+                filters.insert("since".to_string(), serde_json::json!(s));
             }
             let obj = serde_json::json!({
                 "total_calls": 0,
@@ -86,13 +109,22 @@ pub fn run(
     println!();
 
     if no_matching_records {
-        let filter_desc = match (provider_filter, tier_filter) {
-            (Some(p), Some(t)) => format!("provider={p}, tier={t}"),
-            (Some(p), None) => format!("provider={p}"),
-            (None, Some(t)) => format!("tier={t}"),
-            (None, None) => unreachable!(),
-        };
-        println!("No matching records. (filters: {filter_desc})");
+        let mut active_filters = Vec::new();
+        if let Some(p) = provider_filter {
+            active_filters.push(format!("provider={p}"));
+        }
+        if let Some(t) = tier_filter {
+            active_filters.push(format!("tier={t}"));
+        }
+        if let Some(s) = since {
+            active_filters.push(format!("since={s}"));
+        }
+        if !active_filters.is_empty() {
+            println!("No calls found matching: {}.", active_filters.join(", "));
+            println!("Try removing filters or run 'gateway complete' to generate calls.");
+        } else {
+            println!("No calls recorded yet. Run 'gateway complete' to generate calls.");
+        }
         return Ok(());
     }
 
@@ -131,6 +163,9 @@ pub fn run(
         }
     }
 
+    println!();
+    println!("Use --since YYYY-MM-DD to filter by date.");
+
     Ok(())
 }
 
@@ -151,7 +186,13 @@ mod tests {
             "GATEWAY_DB_PATH",
             "/tmp/.test-gateway-stats-nonexistent-99999.db",
         );
-        let result = run(None, false, None, None);
+        let result = run(
+            None,
+            false,
+            None,
+            None,
+            accelmars_gateway_core::OutputConfig::from_env(false),
+        );
         std::env::remove_var("GATEWAY_DB_PATH");
         assert!(
             result.is_ok(),
