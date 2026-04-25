@@ -9,6 +9,9 @@ pub use types::{
     Privacy, RoutingConstraints,
 };
 
+pub mod suggest;
+pub use suggest::suggest_similar;
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
