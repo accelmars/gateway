@@ -394,18 +394,29 @@ async fn fixture_stream_returns_sse_with_content() {
         })
         .collect();
 
+    // Expect at least 2 data chunks: role chunk + at least one content chunk.
     assert!(
-        !chunks.is_empty(),
-        "streaming response must contain at least one data chunk"
+        chunks.len() >= 2,
+        "streaming response must contain at least 2 data chunks (role + content), got {}",
+        chunks.len()
     );
 
-    // First chunk carries the content
-    let content = chunks[0]["choices"][0]["delta"]["content"]
+    // First chunk carries the role (OpenAI convention: role on first delta, no content).
+    let role = chunks[0]["choices"][0]["delta"]["role"]
+        .as_str()
+        .unwrap_or("");
+    assert_eq!(
+        role, "assistant",
+        "first SSE chunk must carry role=assistant"
+    );
+
+    // Second chunk carries the content.
+    let content = chunks[1]["choices"][0]["delta"]["content"]
         .as_str()
         .unwrap_or("");
     assert_eq!(
         content, "Hello! How can I help you today?",
-        "first SSE chunk content must match fixture"
+        "second SSE chunk content must match fixture"
     );
 }
 

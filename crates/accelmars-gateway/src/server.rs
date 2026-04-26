@@ -591,7 +591,7 @@ async fn complete_stream(
         let adapter = current_decision.adapter.clone();
         let req_clone = gateway_req.clone();
 
-        let result = tokio::task::spawn_blocking(move || adapter.complete(&req_clone)).await;
+        let result = tokio::task::spawn_blocking(move || adapter.complete_chunks(&req_clone)).await;
         let latency_ms = start.elapsed().as_millis() as u64;
 
         match result {
@@ -638,24 +638,24 @@ async fn complete_stream(
                 let (status, body) = adapter_error_to_response(&adapter_err);
                 return (status, Json(body)).into_response();
             }
-            Ok(Ok(resp)) => {
+            Ok(Ok(chunked)) => {
                 let total_latency_ms = total_start.elapsed().as_millis() as u64;
                 state.router.on_success(&provider_name);
                 info!(
                     tier = %tier,
                     provider = %provider_name,
-                    model = %resp.model,
+                    model = %chunked.model,
                     latency_ms,
-                    tokens_in = resp.tokens_in,
-                    tokens_out = resp.tokens_out,
+                    tokens_in = chunked.tokens_in,
+                    tokens_out = chunked.tokens_out,
                     stream = true,
                     "completion ok (stream)"
                 );
 
                 let (cost_in, cost_out) = state.router.provider_pricing(&provider_name);
                 let cost_usd = CostTracker::calculate_cost(
-                    resp.tokens_in as u64,
-                    resp.tokens_out as u64,
+                    chunked.tokens_in as u64,
+                    chunked.tokens_out as u64,
                     cost_in,
                     cost_out,
                 );
@@ -666,18 +666,21 @@ async fn complete_stream(
                     crate::telemetry::GEN_AI_SYSTEM,
                     crate::telemetry::provider_to_system(&provider_name),
                 );
-                span.set_attribute(crate::telemetry::GEN_AI_REQUEST_MODEL, resp.model.clone());
+                span.set_attribute(
+                    crate::telemetry::GEN_AI_REQUEST_MODEL,
+                    chunked.model.clone(),
+                );
                 span.set_attribute(
                     crate::telemetry::GEN_AI_USAGE_INPUT_TOKENS,
-                    resp.tokens_in as i64,
+                    chunked.tokens_in as i64,
                 );
                 span.set_attribute(
                     crate::telemetry::GEN_AI_USAGE_OUTPUT_TOKENS,
-                    resp.tokens_out as i64,
+                    chunked.tokens_out as i64,
                 );
                 span.set_attribute(
                     crate::telemetry::GEN_AI_RESPONSE_FINISH_REASONS,
-                    resp.finish_reason.clone(),
+                    chunked.finish_reason.clone(),
                 );
                 span.set_attribute(crate::telemetry::GATEWAY_TIER, tier.to_string());
                 span.set_attribute(crate::telemetry::GATEWAY_PROVIDER, provider_name.clone());
@@ -690,13 +693,13 @@ async fn complete_stream(
                 span.set_attribute(crate::telemetry::GATEWAY_FALLBACK, attempt > 0);
 
                 state.cost_tracker.record(&RequestRecord {
-                    id: resp.id.clone(),
+                    id: chunked.id.clone(),
                     timestamp: iso_now(),
                     tier: tier.to_string(),
                     provider: provider_name,
-                    model: resp.model.clone(),
-                    tokens_in: resp.tokens_in as u64,
-                    tokens_out: resp.tokens_out as u64,
+                    model: chunked.model.clone(),
+                    tokens_in: chunked.tokens_in as u64,
+                    tokens_out: chunked.tokens_out as u64,
                     cost_usd,
                     latency_ms,
                     status: "ok".to_string(),
@@ -707,43 +710,66 @@ async fn complete_stream(
 
                 let now = unix_now();
 
-                let content_chunk = ChatCompletionChunk {
-                    id: resp.id.clone(),
+                // Emit role chunk first (OpenAI convention: role on first delta, empty content).
+                let role_chunk = ChatCompletionChunk {
+                    id: chunked.id.clone(),
                     object: "chat.completion.chunk".to_string(),
                     created: now,
-                    model: resp.model.clone(),
+                    model: chunked.model.clone(),
                     choices: vec![StreamChoice {
                         index: 0,
                         delta: StreamDelta {
                             role: Some("assistant".to_string()),
-                            content: Some(resp.content),
+                            content: None,
                         },
                         finish_reason: None,
                     }],
                 };
 
+                // Build one SSE event per content chunk.
+                let mut events: Vec<Result<Event, Infallible>> =
+                    Vec::with_capacity(2 + chunked.chunks.len());
+                events
+                    .push(Ok(Event::default()
+                        .data(serde_json::to_string(&role_chunk).unwrap_or_default())));
+
+                for chunk in chunked.chunks {
+                    let content_chunk = ChatCompletionChunk {
+                        id: chunked.id.clone(),
+                        object: "chat.completion.chunk".to_string(),
+                        created: now,
+                        model: chunked.model.clone(),
+                        choices: vec![StreamChoice {
+                            index: 0,
+                            delta: StreamDelta {
+                                role: None,
+                                content: Some(chunk),
+                            },
+                            finish_reason: None,
+                        }],
+                    };
+                    events.push(Ok(Event::default()
+                        .data(serde_json::to_string(&content_chunk).unwrap_or_default())));
+                }
+
                 let finish_chunk = ChatCompletionChunk {
-                    id: resp.id,
+                    id: chunked.id,
                     object: "chat.completion.chunk".to_string(),
                     created: now,
-                    model: resp.model,
+                    model: chunked.model,
                     choices: vec![StreamChoice {
                         index: 0,
                         delta: StreamDelta {
                             role: None,
                             content: None,
                         },
-                        finish_reason: Some(resp.finish_reason),
+                        finish_reason: Some(chunked.finish_reason),
                     }],
                 };
-
-                let events: Vec<Result<Event, Infallible>> = vec![
-                    Ok(Event::default()
-                        .data(serde_json::to_string(&content_chunk).unwrap_or_default())),
-                    Ok(Event::default()
-                        .data(serde_json::to_string(&finish_chunk).unwrap_or_default())),
-                    Ok(Event::default().data("[DONE]")),
-                ];
+                events.push(Ok(
+                    Event::default().data(serde_json::to_string(&finish_chunk).unwrap_or_default())
+                ));
+                events.push(Ok(Event::default().data("[DONE]")));
 
                 return Sse::new(stream::iter(events)).into_response();
             }
