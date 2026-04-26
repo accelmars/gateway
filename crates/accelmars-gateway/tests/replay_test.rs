@@ -339,3 +339,105 @@ async fn fixture_round_trip_serialization() {
     let result = loaded.entries[0].response.clone().to_adapter_result();
     assert_eq!(result.unwrap().content, "round-trip response");
 }
+
+// ---------------------------------------------------------------------------
+// Test 7: Streaming request to fixture returns SSE with content
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fixture_stream_returns_sse_with_content() {
+    let base = start_replay_server("gemini-quick-hello.json").await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "quick",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "streaming request to fixture must return 200"
+    );
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.contains("text/event-stream"),
+        "streaming response must have text/event-stream content-type, got: {content_type}"
+    );
+
+    let body = resp.text().await.unwrap();
+
+    // Parse SSE: split on double-newline, collect data: lines, skip [DONE]
+    let chunks: Vec<serde_json::Value> = body
+        .split("\n\n")
+        .filter_map(|block| {
+            let line = block.trim();
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data == "[DONE]" {
+                    return None;
+                }
+                serde_json::from_str(data).ok()
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert!(
+        !chunks.is_empty(),
+        "streaming response must contain at least one data chunk"
+    );
+
+    // First chunk carries the content
+    let content = chunks[0]["choices"][0]["delta"]["content"]
+        .as_str()
+        .unwrap_or("");
+    assert_eq!(
+        content, "Hello! How can I help you today?",
+        "first SSE chunk content must match fixture"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: Streaming request with error fixture returns HTTP error (not SSE)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fixture_stream_error_returns_http_error() {
+    let base = start_replay_server("error-rate-limit.json").await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "standard",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        429,
+        "rate-limit error in streaming request must return HTTP 429 (not an SSE event)"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"].as_str().is_some(),
+        "error response body must contain error.message"
+    );
+}
