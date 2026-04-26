@@ -2,11 +2,17 @@ use std::io;
 use std::path::Path;
 use std::sync::Mutex;
 
-use accelmars_gateway_core::{AdapterError, GatewayRequest, GatewayResponse, ProviderAdapter};
+use accelmars_gateway_core::{
+    AdapterError, ChunkedResponse, GatewayRequest, GatewayResponse, ProviderAdapter,
+};
 use serde::{Deserialize, Serialize};
 
 /// Schema version for cassette files. Bump on breaking changes.
 pub const CASSETTE_SCHEMA_VERSION: &str = "1";
+
+/// Schema version required for cassettes that contain `streaming_success` entries.
+/// Cassette authors must set `schema_version: "2"` in the top-level JSON object.
+pub const CASSETTE_SCHEMA_VERSION_STREAMING: &str = "2";
 
 /// Optional content-based match criteria for a cassette entry.
 ///
@@ -85,6 +91,21 @@ pub struct CassetteEntry {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CassetteResponse {
     Success(GatewayResponse),
+    /// Multi-chunk streaming response. Requires `schema_version: "2"` in the cassette.
+    ///
+    /// Each element in `chunks` maps to one SSE `data:` event emitted by the server.
+    /// `FixtureAdapter::complete_chunks()` returns these as-is in a [`ChunkedResponse`].
+    ///
+    /// For single-chunk behavior, use `Success` instead — `complete_chunks()` wraps it
+    /// in `vec![content]` automatically.
+    StreamingSuccess {
+        id: String,
+        model: String,
+        chunks: Vec<String>,
+        tokens_in: u32,
+        tokens_out: u32,
+        finish_reason: String,
+    },
     Error {
         kind: String,
         message: String,
@@ -100,6 +121,60 @@ impl CassetteResponse {
     pub fn to_adapter_result(self) -> Result<GatewayResponse, AdapterError> {
         match self {
             Self::Success(r) => Ok(r),
+            Self::StreamingSuccess { .. } => Err(AdapterError::ProviderError(
+                "streaming_success entry — use complete_chunks() for streaming cassettes"
+                    .to_string(),
+            )),
+            Self::Error {
+                kind,
+                message,
+                retry_after_ms,
+            } => {
+                let retry_after = retry_after_ms.map(std::time::Duration::from_millis);
+                Err(match kind.as_str() {
+                    "rate_limit" => AdapterError::RateLimit { retry_after },
+                    "auth_error" => AdapterError::AuthError(message),
+                    "timeout" => AdapterError::Timeout,
+                    "provider_error" => AdapterError::ProviderError(message),
+                    "parse_error" => AdapterError::ParseError(message),
+                    other => AdapterError::ProviderError(format!(
+                        "unknown cassette error kind '{other}': {message}"
+                    )),
+                })
+            }
+        }
+    }
+
+    /// Convert to the `Result` type expected by `ProviderAdapter::complete_chunks`.
+    ///
+    /// - `StreamingSuccess`: returns chunks from the cassette as-is.
+    /// - `Success`: wraps `content` in a single-element `Vec` (Phase 1 fallback).
+    /// - `Error`: maps to the same [`AdapterError`] variants as [`to_adapter_result`].
+    pub fn to_chunked_result(self) -> Result<ChunkedResponse, AdapterError> {
+        match self {
+            Self::StreamingSuccess {
+                id,
+                model,
+                chunks,
+                tokens_in,
+                tokens_out,
+                finish_reason,
+            } => Ok(ChunkedResponse {
+                id,
+                model,
+                chunks,
+                tokens_in,
+                tokens_out,
+                finish_reason,
+            }),
+            Self::Success(r) => Ok(ChunkedResponse {
+                id: r.id,
+                model: r.model,
+                chunks: vec![r.content],
+                tokens_in: r.tokens_in,
+                tokens_out: r.tokens_out,
+                finish_reason: r.finish_reason,
+            }),
             Self::Error {
                 kind,
                 message,
@@ -151,6 +226,7 @@ impl Cassette {
 /// route through `GatewayMode::Mock` in integration tests.
 ///
 /// [`RecordedAdapter`]: crate::adapters::recorded::RecordedAdapter
+#[derive(Debug)]
 pub struct FixtureAdapter {
     adapter_name: String,
     entries: Mutex<Vec<CassetteEntry>>,
@@ -158,17 +234,43 @@ pub struct FixtureAdapter {
 
 impl FixtureAdapter {
     /// Load from an in-memory [`Cassette`]. The adapter presents itself under `name`.
-    pub fn from_cassette(name: impl Into<String>, cassette: Cassette) -> Self {
-        Self {
+    ///
+    /// Returns `Err` if:
+    /// - `schema_version` is not `"1"` or `"2"` (rule V-72)
+    /// - `schema_version` is `"1"` and any entry is `StreamingSuccess` (rule V-70)
+    pub fn from_cassette(name: impl Into<String>, cassette: Cassette) -> io::Result<Self> {
+        match cassette.schema_version.as_str() {
+            "1" => {
+                for entry in &cassette.entries {
+                    if matches!(&entry.response, CassetteResponse::StreamingSuccess { .. }) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "schema_version \"1\" cassette contains streaming_success entry \
+                             — set schema_version to \"2\"",
+                        ));
+                    }
+                }
+            }
+            "2" => {}
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported cassette schema_version \"{other}\" — expected \"1\" or \"2\""
+                    ),
+                ));
+            }
+        }
+        Ok(Self {
             adapter_name: name.into(),
             entries: Mutex::new(cassette.entries),
-        }
+        })
     }
 
     /// Load from a cassette file on disk. The adapter presents itself under `name`.
     pub fn from_file(name: impl Into<String>, path: &Path) -> io::Result<Self> {
         let cassette = Cassette::from_file(path)?;
-        Ok(Self::from_cassette(name, cassette))
+        Self::from_cassette(name, cassette)
     }
 }
 
@@ -189,6 +291,23 @@ impl ProviderAdapter for FixtureAdapter {
         }; // lock drops here
         match maybe_response {
             Some(response) => response.to_adapter_result(),
+            None => Err(AdapterError::ProviderError(
+                "cassette exhausted — no matching entry".to_string(),
+            )),
+        }
+    }
+
+    fn complete_chunks(&self, request: &GatewayRequest) -> Result<ChunkedResponse, AdapterError> {
+        let maybe_response = {
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            let keyed_idx = entries
+                .iter()
+                .position(|e| e.match_key.as_ref().is_some_and(|m| m.matches(request)));
+            let idx = keyed_idx.or_else(|| entries.iter().position(|e| e.match_key.is_none()));
+            idx.map(|i| entries.remove(i).response)
+        }; // lock drops here
+        match maybe_response {
+            Some(response) => response.to_chunked_result(),
             None => Err(AdapterError::ProviderError(
                 "cassette exhausted — no matching entry".to_string(),
             )),
@@ -310,6 +429,7 @@ impl<A: ProviderAdapter> ProviderAdapter for RecordingAdapter<A> {
 mod tests {
     use super::*;
     use accelmars_gateway_core::{Message, ModelTier, RoutingConstraints};
+    use std::io;
 
     fn make_request() -> GatewayRequest {
         GatewayRequest {
@@ -356,6 +476,26 @@ mod tests {
             provider: "test".to_string(),
             recorded_at: "2026-04-22T00:00:00Z".to_string(),
             entries,
+        }
+    }
+
+    fn make_streaming_cassette(chunks: Vec<&str>) -> Cassette {
+        Cassette {
+            schema_version: CASSETTE_SCHEMA_VERSION_STREAMING.to_string(),
+            provider: "test".to_string(),
+            recorded_at: "2026-04-26T00:00:00Z".to_string(),
+            entries: vec![CassetteEntry {
+                request: make_request(),
+                response: CassetteResponse::StreamingSuccess {
+                    id: "fixture-stream-1".to_string(),
+                    model: "deepseek-chat".to_string(),
+                    chunks: chunks.into_iter().map(str::to_string).collect(),
+                    tokens_in: 10,
+                    tokens_out: 20,
+                    finish_reason: "stop".to_string(),
+                },
+                match_key: None,
+            }],
         }
     }
 
@@ -517,7 +657,7 @@ mod tests {
                 match_key: None,
             },
         ]);
-        let adapter = FixtureAdapter::from_cassette("test", cassette);
+        let adapter = FixtureAdapter::from_cassette("test", cassette).unwrap();
         let req = make_request();
         assert_eq!(adapter.complete(&req).unwrap().content, "first");
         assert_eq!(adapter.complete(&req).unwrap().content, "second");
@@ -530,7 +670,7 @@ mod tests {
             response: CassetteResponse::Success(make_response("one")),
             match_key: None,
         }]);
-        let adapter = FixtureAdapter::from_cassette("test", cassette);
+        let adapter = FixtureAdapter::from_cassette("test", cassette).unwrap();
         let req = make_request();
         assert!(adapter.complete(&req).is_ok());
         let err = adapter.complete(&req).unwrap_err();
@@ -539,7 +679,7 @@ mod tests {
 
     #[test]
     fn fixture_adapter_is_always_available() {
-        let adapter = FixtureAdapter::from_cassette("test", make_cassette(vec![]));
+        let adapter = FixtureAdapter::from_cassette("test", make_cassette(vec![])).unwrap();
         assert!(adapter.is_available());
         assert_eq!(adapter.name(), "test");
     }
@@ -607,7 +747,7 @@ mod tests {
                 }),
             },
         ]);
-        let adapter = FixtureAdapter::from_cassette("test", cassette);
+        let adapter = FixtureAdapter::from_cassette("test", cassette).unwrap();
         let req = make_max_request();
         // Keyed entry consumed first (position 1 skips ahead of position 0)
         assert_eq!(adapter.complete(&req).unwrap().content, "keyed");
@@ -634,7 +774,7 @@ mod tests {
                 match_key: None,
             },
         ]);
-        let adapter = FixtureAdapter::from_cassette("test", cassette);
+        let adapter = FixtureAdapter::from_cassette("test", cassette).unwrap();
         let req = make_max_request();
         // Max request does not match standard keyed entry → sequential fallback
         assert_eq!(adapter.complete(&req).unwrap().content, "sequential");
@@ -652,7 +792,7 @@ mod tests {
                 ..Default::default()
             }),
         }]);
-        let adapter = FixtureAdapter::from_cassette("test", cassette);
+        let adapter = FixtureAdapter::from_cassette("test", cassette).unwrap();
         let req = make_max_request();
         let err = adapter.complete(&req).unwrap_err();
         assert!(
@@ -676,7 +816,7 @@ mod tests {
                 match_key: Some(EntryMatcher::default()),
             },
         ]);
-        let adapter = FixtureAdapter::from_cassette("test", cassette);
+        let adapter = FixtureAdapter::from_cassette("test", cassette).unwrap();
         let req = make_request();
         // All-None matcher is keyed and matches any request — consumed first
         assert_eq!(adapter.complete(&req).unwrap().content, "all-none-keyed");
@@ -708,7 +848,7 @@ mod tests {
                 match_key: None,
             },
         ]);
-        let adapter = FixtureAdapter::from_cassette("test", cassette);
+        let adapter = FixtureAdapter::from_cassette("test", cassette).unwrap();
         // Max-tier request consumes keyed entry at index 1
         assert_eq!(
             adapter.complete(&make_max_request()).unwrap().content,
@@ -719,5 +859,117 @@ mod tests {
         assert_eq!(adapter.complete(&make_request()).unwrap().content, "seq-2");
         // Cassette exhausted
         assert!(adapter.complete(&make_request()).is_err());
+    }
+
+    // --- StreamingSuccess variant + complete_chunks() override ---
+
+    #[test]
+    fn streaming_success_round_trips() {
+        // StreamingSuccess serializes as type: "streaming_success" and deserializes back correctly.
+        let cassette = make_streaming_cassette(vec!["Hello", " world"]);
+        let json = serde_json::to_string(&cassette).unwrap();
+        assert!(json.contains("\"streaming_success\""));
+        let deserialized: Cassette = serde_json::from_str(&json).unwrap();
+        let entry = deserialized.entries.into_iter().next().unwrap();
+        assert!(
+            matches!(&entry.response, CassetteResponse::StreamingSuccess { chunks, .. } if chunks.len() == 2)
+        );
+    }
+
+    #[test]
+    fn fixture_complete_chunks_returns_multi_chunk() {
+        // complete_chunks() with a StreamingSuccess entry returns all chunks.
+        let cassette = make_streaming_cassette(vec!["Hello", " there", "!"]);
+        let adapter = FixtureAdapter::from_cassette("test", cassette).unwrap();
+        let result = adapter.complete_chunks(&make_request()).unwrap();
+        assert_eq!(result.chunks, vec!["Hello", " there", "!"]);
+        assert_eq!(result.model, "deepseek-chat");
+        assert_eq!(result.finish_reason, "stop");
+    }
+
+    #[test]
+    fn fixture_complete_chunks_wraps_success_in_single_chunk() {
+        // complete_chunks() with a Success entry falls back to single-chunk wrapping.
+        let cassette = make_cassette(vec![CassetteEntry {
+            request: make_request(),
+            response: CassetteResponse::Success(make_response("full content")),
+            match_key: None,
+        }]);
+        let adapter = FixtureAdapter::from_cassette("test", cassette).unwrap();
+        let result = adapter.complete_chunks(&make_request()).unwrap();
+        assert_eq!(result.chunks, vec!["full content"]);
+    }
+
+    #[test]
+    fn fixture_complete_chunks_error_entry_returns_adapter_error() {
+        // complete_chunks() with an Error entry returns the correct AdapterError variant.
+        let cassette = make_cassette(vec![CassetteEntry {
+            request: make_request(),
+            response: CassetteResponse::Error {
+                kind: "rate_limit".to_string(),
+                message: "too many".to_string(),
+                retry_after_ms: Some(5_000),
+            },
+            match_key: None,
+        }]);
+        let adapter = FixtureAdapter::from_cassette("test", cassette).unwrap();
+        let err = adapter.complete_chunks(&make_request()).unwrap_err();
+        assert!(matches!(
+            err,
+            AdapterError::RateLimit {
+                retry_after: Some(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn fixture_complete_chunks_exhaustion_returns_error() {
+        // complete_chunks() after cassette is exhausted returns ProviderError.
+        let cassette = make_streaming_cassette(vec!["one chunk"]);
+        let adapter = FixtureAdapter::from_cassette("test", cassette).unwrap();
+        assert!(adapter.complete_chunks(&make_request()).is_ok());
+        let err = adapter.complete_chunks(&make_request()).unwrap_err();
+        assert!(
+            matches!(&err, AdapterError::ProviderError(msg) if msg.contains("cassette exhausted"))
+        );
+    }
+
+    #[test]
+    fn schema_version_v2_required_for_streaming_success() {
+        // Rule V-70: schema "1" cassette with a streaming_success entry must be rejected at load time.
+        let cassette = Cassette {
+            schema_version: "1".to_string(), // wrong version for StreamingSuccess
+            provider: "test".to_string(),
+            recorded_at: "2026-04-26T00:00:00Z".to_string(),
+            entries: vec![CassetteEntry {
+                request: make_request(),
+                response: CassetteResponse::StreamingSuccess {
+                    id: "f".to_string(),
+                    model: "m".to_string(),
+                    chunks: vec!["hello".to_string()],
+                    tokens_in: 1,
+                    tokens_out: 1,
+                    finish_reason: "stop".to_string(),
+                },
+                match_key: None,
+            }],
+        };
+        let err = FixtureAdapter::from_cassette("test", cassette).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("schema_version"));
+    }
+
+    #[test]
+    fn schema_version_unknown_rejected() {
+        // Rule V-72: an unsupported schema_version string must be rejected with InvalidData.
+        let cassette = Cassette {
+            schema_version: "99".to_string(),
+            provider: "test".to_string(),
+            recorded_at: "2026-04-26T00:00:00Z".to_string(),
+            entries: vec![],
+        };
+        let err = FixtureAdapter::from_cassette("test", cassette).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("99"));
     }
 }
