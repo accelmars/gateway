@@ -5,8 +5,8 @@ pub mod types;
 pub use adapter::{AdapterError, ProviderAdapter};
 pub use mock::MockAdapter;
 pub use types::{
-    Capability, CostPreference, GatewayRequest, GatewayResponse, Latency, Message, ModelTier,
-    Privacy, RoutingConstraints,
+    Capability, ChunkedResponse, CostPreference, GatewayRequest, GatewayResponse, Latency, Message,
+    ModelTier, Privacy, RoutingConstraints,
 };
 
 pub mod suggest;
@@ -139,5 +139,22 @@ mod tests {
         let response = adapter.complete(&request).unwrap();
         assert!(response.tokens_in > 0);
         assert!(response.tokens_out > 0);
+    }
+
+    #[test]
+    fn mock_adapter_complete_chunks_default_returns_single_chunk() {
+        let adapter = MockAdapter::new("hello from mock");
+        let request = make_request();
+        let chunked = adapter.complete_chunks(&request).unwrap();
+        assert_eq!(
+            chunked.chunks,
+            vec!["hello from mock"],
+            "default impl must wrap content in a single-element Vec"
+        );
+        assert_eq!(chunked.model, "mock");
+        assert_eq!(chunked.finish_reason, "stop");
+        assert!(chunked.id.starts_with("mock-"));
+        assert!(chunked.tokens_in > 0);
+        assert!(chunked.tokens_out > 0);
     }
 }

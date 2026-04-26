@@ -175,3 +175,31 @@ pub struct GatewayResponse {
     pub tokens_out: u32,
     pub finish_reason: String,
 }
+
+/// Streaming completion response — content split across ordered chunks.
+///
+/// Replaces [`GatewayResponse`] on the streaming path. Preserves all metadata
+/// fields required by cost tracking (tokens, model) and OTel (id, finish_reason).
+///
+/// The `chunks` field replaces `content: String` — each element maps to one
+/// SSE `data:` event in the server's `complete_stream()` handler.
+///
+/// The default impl of [`ProviderAdapter::complete_chunks`] populates
+/// `chunks` as a single-element `vec![response.content]`, preserving
+/// Phase 1 behavior for adapters that have not yet implemented true streaming.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkedResponse {
+    /// Request identifier — same format as [`GatewayResponse::id`].
+    pub id: String,
+    /// Provider model name — used for OTel and SSE chunk `model` field.
+    pub model: String,
+    /// Ordered content chunks. One SSE `data:` event per element.
+    /// Single-element for adapters using the default impl.
+    pub chunks: Vec<String>,
+    /// Input token count — used for cost calculation and OTel.
+    pub tokens_in: u32,
+    /// Output token count — used for cost calculation and OTel.
+    pub tokens_out: u32,
+    /// Completion reason — used for OTel and the SSE finish event.
+    pub finish_reason: String,
+}

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::types::{GatewayRequest, GatewayResponse};
+use crate::types::{ChunkedResponse, GatewayRequest, GatewayResponse};
 
 /// The universal provider adapter trait.
 ///
@@ -19,6 +19,36 @@ pub trait ProviderAdapter: Send + Sync {
     /// # Errors
     /// Returns [`AdapterError`] for rate limits, auth failures, timeouts, or parse errors.
     fn complete(&self, request: &GatewayRequest) -> Result<GatewayResponse, AdapterError>;
+
+    /// Execute a streaming completion, returning content as an ordered `Vec` of chunks.
+    ///
+    /// Each element in the returned `Vec<String>` maps to one SSE `data:` event.
+    /// The server emits them sequentially — the first element contains the opening
+    /// tokens, the last contains the tail before `finish_reason`.
+    ///
+    /// # Default Implementation
+    /// Calls [`complete`] and wraps `response.content` in a single-element `Vec`.
+    /// This preserves Phase 1 streaming behavior (one SSE event, full content) for
+    /// all adapters that have not yet implemented true token-level streaming.
+    ///
+    /// # Override
+    /// Adapters that support server-sent streaming (Gemini, DeepSeek, Claude, etc.)
+    /// override this method to return token-level granularity by consuming the
+    /// provider's SSE stream inside a `tokio::task::spawn_blocking` closure.
+    ///
+    /// # Error Handling
+    /// Returns [`AdapterError`] for all failure cases — same as [`complete`].
+    /// A partial chunk `Vec` should NOT be returned on error; return `Err` instead.
+    fn complete_chunks(&self, request: &GatewayRequest) -> Result<ChunkedResponse, AdapterError> {
+        self.complete(request).map(|r| ChunkedResponse {
+            id: r.id,
+            model: r.model,
+            chunks: vec![r.content],
+            tokens_in: r.tokens_in,
+            tokens_out: r.tokens_out,
+            finish_reason: r.finish_reason,
+        })
+    }
 
     /// Whether this provider is currently reachable and configured.
     fn is_available(&self) -> bool;
