@@ -16,6 +16,8 @@ pub struct GatewayConfig {
     pub port: u16,
     pub log_level: String,
     pub mode: GatewayMode,
+    /// Path to a cassette file for fixture mode. Set via GATEWAY_FIXTURE_FILE or config.
+    pub fixture_file: Option<String>,
     pub concurrency: ConcurrencyConfig,
     pub tiers: TierConfig,
     pub providers: HashMap<String, ProviderConfig>,
@@ -28,6 +30,7 @@ impl Default for GatewayConfig {
             port: 8080,
             log_level: "info".to_string(),
             mode: GatewayMode::Normal,
+            fixture_file: None,
             concurrency: ConcurrencyConfig::default(),
             tiers: TierConfig::default(),
             providers: HashMap::new(),
@@ -78,6 +81,14 @@ impl GatewayConfig {
             cfg.mode = GatewayMode::Mock;
         }
 
+        // Layer 4b: GATEWAY_MODE=fixture + GATEWAY_FIXTURE_FILE
+        if std::env::var("GATEWAY_MODE").as_deref() == Ok("fixture") {
+            cfg.mode = GatewayMode::Fixture;
+        }
+        if let Ok(path) = std::env::var("GATEWAY_FIXTURE_FILE") {
+            cfg.fixture_file = Some(path);
+        }
+
         Ok(cfg)
     }
 
@@ -101,6 +112,23 @@ impl GatewayConfig {
 
         // In mock mode: no provider validation needed
         if self.mode == GatewayMode::Mock {
+            return Ok(warnings);
+        }
+
+        // In fixture mode: validate fixture_file is set and exists; skip provider validation
+        if self.mode == GatewayMode::Fixture {
+            match &self.fixture_file {
+                None => {
+                    anyhow::bail!("GATEWAY_MODE=fixture requires GATEWAY_FIXTURE_FILE to be set")
+                }
+                Some(path) => {
+                    if !std::path::Path::new(path).exists() {
+                        anyhow::bail!(
+                            "fixture file not found: '{path}' — check GATEWAY_FIXTURE_FILE"
+                        );
+                    }
+                }
+            }
             return Ok(warnings);
         }
 
@@ -149,6 +177,8 @@ pub enum GatewayMode {
     Normal,
     /// Mock mode — all requests routed to MockAdapter. GATEWAY_MODE=mock.
     Mock,
+    /// Fixture mode — route all requests through FixtureAdapter loaded from GATEWAY_FIXTURE_FILE.
+    Fixture,
 }
 
 /// Concurrency limits (used by PF-005).
@@ -312,6 +342,35 @@ free_only = ["gemini"]
         let toml = r#"mode = "mock""#;
         let cfg = GatewayConfig::from_toml_str(toml).unwrap();
         assert_eq!(cfg.mode, GatewayMode::Mock);
+    }
+
+    #[test]
+    fn gateway_mode_fixture_deserializes() {
+        let toml = r#"mode = "fixture""#;
+        let cfg = GatewayConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.mode, GatewayMode::Fixture);
+    }
+
+    #[test]
+    fn validate_fixture_mode_requires_fixture_file() {
+        let toml = r#"mode = "fixture""#;
+        let cfg = GatewayConfig::from_toml_str(toml).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("GATEWAY_FIXTURE_FILE"),
+            "error must mention GATEWAY_FIXTURE_FILE, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_fixture_mode_rejects_missing_file() {
+        let toml = "mode = \"fixture\"\nfixture_file = \"/nonexistent/path/cassette.json\"";
+        let cfg = GatewayConfig::from_toml_str(toml).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("fixture file not found"),
+            "error must mention 'fixture file not found', got: {err}"
+        );
     }
 
     #[test]

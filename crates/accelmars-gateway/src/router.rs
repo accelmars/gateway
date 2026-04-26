@@ -622,6 +622,7 @@ mod tests {
             port: 8080,
             log_level: "info".to_string(),
             mode,
+            fixture_file: None,
             concurrency: crate::config::ConcurrencyConfig { max: 20 },
             tiers: TierConfig {
                 quick: "gemini".to_string(),
