@@ -149,17 +149,39 @@ enum KeysAction {
 }
 
 fn build_registry_from_config(config: &GatewayConfig) -> AdapterRegistry {
+    use accelmars_gateway::adapters::fixture::FixtureAdapter;
     use accelmars_gateway::config::GatewayMode;
 
     let mut registry = AdapterRegistry::new();
 
-    // Mock adapter — always registered (used by mock mode + fallback)
-    registry.register(Arc::new(MockAdapter::default()));
-
     if config.mode == GatewayMode::Mock {
+        registry.register(Arc::new(MockAdapter::default()));
         tracing::info!("GATEWAY_MODE=mock — mock adapter only");
         return registry;
     }
+
+    if config.mode == GatewayMode::Fixture {
+        // validate() ensures fixture_file is set and exists before main() calls this function.
+        // The expect() is safe — the invariant is enforced by the validate() call in main().
+        let path = config.fixture_file.as_deref().expect(
+            "fixture_file must be set in fixture mode — validate() should have caught this",
+        );
+        match FixtureAdapter::from_file("mock", std::path::Path::new(path)) {
+            Ok(adapter) => {
+                registry.register(Arc::new(adapter));
+                tracing::info!(path = path, "GATEWAY_MODE=fixture — fixture adapter loaded");
+            }
+            Err(e) => {
+                // validate() already checked file existence; this is a read/parse error
+                tracing::error!(path = path, error = %e, "failed to load fixture file");
+                std::process::exit(1);
+            }
+        }
+        return registry;
+    }
+
+    // Normal mode: always register mock as fallback, then configured providers
+    registry.register(Arc::new(MockAdapter::default()));
 
     for (name, provider_cfg) in &config.providers {
         let api_key = std::env::var(&provider_cfg.api_key_env).ok();

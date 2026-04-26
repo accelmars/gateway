@@ -210,6 +210,81 @@ async fn replay_exhausted_cassette_returns_502() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 6: Fixture mode activated via config (not env var)
+// ---------------------------------------------------------------------------
+//
+// Proves that GatewayMode::Fixture routes through FixtureAdapter:
+// 1. Config has mode="fixture" — router does NOT call resolve_mock() (mode != Mock)
+// 2. No providers configured — resolve_with_fallback() exhausts the tier lookup
+// 3. Router falls to its mock-fallback path: registry.get("mock") → FixtureAdapter
+// 4. Cassette response is served correctly
+
+#[tokio::test]
+async fn fixture_mode_serves_cassette_responses_via_config() {
+    let fixture_path_buf = fixture_path("gemini-quick-hello.json");
+    let fixture_path_str = fixture_path_buf.to_string_lossy().to_string();
+
+    // Build config with mode=fixture and fixture_file set
+    let toml = format!("mode = \"fixture\"\nfixture_file = \"{fixture_path_str}\"");
+    let config = GatewayConfig::from_toml_str(&toml).unwrap();
+    assert_eq!(config.mode, GatewayMode::Fixture);
+
+    let adapter = FixtureAdapter::from_file("mock", &fixture_path_buf)
+        .expect("fixture file must exist and be valid");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(adapter));
+
+    let router = Arc::new(Router::new(config, registry));
+    let limiter = Arc::new(ConcurrencyLimiter::new(20));
+    let cost_tracker = Arc::new(CostTracker::open(std::path::Path::new(":memory:")).unwrap());
+    let auth_store = Arc::new(AuthStore::in_memory().unwrap());
+
+    tokio::spawn(async move {
+        serve_with_listener(
+            listener,
+            router,
+            limiter,
+            cost_tracker,
+            auth_store,
+            true,
+            port,
+        )
+        .await
+        .ok();
+    });
+    tokio::task::yield_now().await;
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "quick",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("");
+    assert_eq!(
+        content, "Hello! How can I help you today?",
+        "fixture mode must serve cassette responses via config"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test 5: Cassette round-trip serialization (no server required)
 // ---------------------------------------------------------------------------
 
