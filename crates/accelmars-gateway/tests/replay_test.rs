@@ -321,6 +321,7 @@ async fn fixture_round_trip_serialization() {
                 tokens_out: 5,
                 finish_reason: "stop".to_string(),
             }),
+            match_key: None,
         }],
     };
 

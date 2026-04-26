@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
 use std::sync::Mutex;
@@ -9,11 +8,75 @@ use serde::{Deserialize, Serialize};
 /// Schema version for cassette files. Bump on breaking changes.
 pub const CASSETTE_SCHEMA_VERSION: &str = "1";
 
+/// Optional content-based match criteria for a cassette entry.
+///
+/// All fields are optional — a field set to `None` matches any value for that dimension.
+/// An `EntryMatcher` with all fields `None` is valid but unusual: it matches any request,
+/// behaving identically to sequential mode.
+/// A cassette entry without a `match_key` (`None`) always falls through to sequential replay.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EntryMatcher {
+    /// Match if request tier equals this value. Case-insensitive.
+    /// Valid values: `"quick"` | `"standard"` | `"max"` | `"ultra"`.
+    /// A mismatched tier produces no match (not an error).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+
+    /// Match if the last message in the request contains this substring.
+    /// Case-insensitive. Matches on `request.messages.last().content`.
+    /// If the request has no messages, this criterion is not satisfied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_message_contains: Option<String>,
+
+    /// Match if the total message count equals this value.
+    /// Counts all messages in `request.messages`, including system messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<usize>,
+}
+
+impl EntryMatcher {
+    /// Returns `true` if all non-`None` fields in this matcher satisfy `request`.
+    ///
+    /// Evaluation is AND-logic: every non-`None` field must match for the overall
+    /// result to be `true`. A matcher with all fields `None` always returns `true`.
+    pub fn matches(&self, request: &GatewayRequest) -> bool {
+        if let Some(tier) = &self.tier {
+            if request.tier.to_string() != tier.to_lowercase() {
+                return false;
+            }
+        }
+        if let Some(contains) = &self.last_message_contains {
+            let last_content = request
+                .messages
+                .last()
+                .map(|m| m.content.to_lowercase())
+                .unwrap_or_default();
+            if !last_content.contains(&contains.to_lowercase()) {
+                return false;
+            }
+        }
+        if let Some(count) = self.message_count {
+            if request.messages.len() != count {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// A recorded interaction: one request and its response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CassetteEntry {
     pub request: GatewayRequest,
     pub response: CassetteResponse,
+    /// Optional match criteria. `None` means sequential replay (existing behavior).
+    ///
+    /// When `Some`, the entry participates in keyed lookup: the adapter scans all
+    /// entries with `match_key: Some(m)` and returns the first one where `m.matches(request)`.
+    /// Only if no keyed entry matches does the adapter fall back to sequential replay
+    /// (the first entry with `match_key: None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_key: Option<EntryMatcher>,
 }
 
 /// The response side of a cassette entry.
@@ -90,7 +153,7 @@ impl Cassette {
 /// [`RecordedAdapter`]: crate::adapters::recorded::RecordedAdapter
 pub struct FixtureAdapter {
     adapter_name: String,
-    entries: Mutex<VecDeque<CassetteEntry>>,
+    entries: Mutex<Vec<CassetteEntry>>,
 }
 
 impl FixtureAdapter {
@@ -98,7 +161,7 @@ impl FixtureAdapter {
     pub fn from_cassette(name: impl Into<String>, cassette: Cassette) -> Self {
         Self {
             adapter_name: name.into(),
-            entries: Mutex::new(VecDeque::from(cassette.entries)),
+            entries: Mutex::new(cassette.entries),
         }
     }
 
@@ -114,12 +177,20 @@ impl ProviderAdapter for FixtureAdapter {
         &self.adapter_name
     }
 
-    fn complete(&self, _request: &GatewayRequest) -> Result<GatewayResponse, AdapterError> {
-        let mut queue = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        match queue.pop_front() {
-            Some(entry) => entry.response.to_adapter_result(),
+    fn complete(&self, request: &GatewayRequest) -> Result<GatewayResponse, AdapterError> {
+        let maybe_response = {
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            // Keyed lookup first; sequential fallback if no keyed entry matches.
+            let keyed_idx = entries
+                .iter()
+                .position(|e| e.match_key.as_ref().is_some_and(|m| m.matches(request)));
+            let idx = keyed_idx.or_else(|| entries.iter().position(|e| e.match_key.is_none()));
+            idx.map(|i| entries.remove(i).response)
+        }; // lock drops here
+        match maybe_response {
+            Some(response) => response.to_adapter_result(),
             None => Err(AdapterError::ProviderError(
-                "cassette exhausted — no more recorded responses".to_string(),
+                "cassette exhausted — no matching entry".to_string(),
             )),
         }
     }
@@ -225,6 +296,7 @@ impl<A: ProviderAdapter> ProviderAdapter for RecordingAdapter<A> {
         entries.push(CassetteEntry {
             request: request.clone(),
             response: cassette_response,
+            match_key: None,
         });
         result
     }
@@ -246,6 +318,20 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: "Hello".to_string(),
+            }],
+            max_tokens: None,
+            stream: false,
+            metadata: Default::default(),
+        }
+    }
+
+    fn make_max_request() -> GatewayRequest {
+        GatewayRequest {
+            tier: ModelTier::Max,
+            constraints: RoutingConstraints::default(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "synthesize decision".to_string(),
             }],
             max_tokens: None,
             stream: false,
@@ -281,6 +367,7 @@ mod tests {
         let cassette = make_cassette(vec![CassetteEntry {
             request: make_request(),
             response: CassetteResponse::Success(response),
+            match_key: None,
         }]);
         let json = serde_json::to_string(&cassette).unwrap();
         let deserialized: Cassette = serde_json::from_str(&json).unwrap();
@@ -303,6 +390,7 @@ mod tests {
                 message: "rate limited".to_string(),
                 retry_after_ms: Some(30_000),
             },
+            match_key: None,
         }]);
         let json = serde_json::to_string(&cassette).unwrap();
         let deserialized: Cassette = serde_json::from_str(&json).unwrap();
@@ -330,6 +418,7 @@ mod tests {
                 message: "invalid api key".to_string(),
                 retry_after_ms: None,
             },
+            match_key: None,
         }]);
         let json = serde_json::to_string(&cassette).unwrap();
         let deserialized: Cassette = serde_json::from_str(&json).unwrap();
@@ -352,6 +441,7 @@ mod tests {
                 message: "timed out".to_string(),
                 retry_after_ms: None,
             },
+            match_key: None,
         }]);
         let json = serde_json::to_string(&cassette).unwrap();
         let deserialized: Cassette = serde_json::from_str(&json).unwrap();
@@ -374,6 +464,7 @@ mod tests {
                 message: "internal server error".to_string(),
                 retry_after_ms: None,
             },
+            match_key: None,
         }]);
         let json = serde_json::to_string(&cassette).unwrap();
         let deserialized: Cassette = serde_json::from_str(&json).unwrap();
@@ -396,6 +487,7 @@ mod tests {
                 message: "unexpected format".to_string(),
                 retry_after_ms: None,
             },
+            match_key: None,
         }]);
         let json = serde_json::to_string(&cassette).unwrap();
         let deserialized: Cassette = serde_json::from_str(&json).unwrap();
@@ -417,10 +509,12 @@ mod tests {
             CassetteEntry {
                 request: make_request(),
                 response: CassetteResponse::Success(make_response("first")),
+                match_key: None,
             },
             CassetteEntry {
                 request: make_request(),
                 response: CassetteResponse::Success(make_response("second")),
+                match_key: None,
             },
         ]);
         let adapter = FixtureAdapter::from_cassette("test", cassette);
@@ -434,6 +528,7 @@ mod tests {
         let cassette = make_cassette(vec![CassetteEntry {
             request: make_request(),
             response: CassetteResponse::Success(make_response("one")),
+            match_key: None,
         }]);
         let adapter = FixtureAdapter::from_cassette("test", cassette);
         let req = make_request();
@@ -457,6 +552,7 @@ mod tests {
             CassetteEntry {
                 request: make_request(),
                 response: CassetteResponse::Success(make_response("hello")),
+                match_key: None,
             },
             CassetteEntry {
                 request: make_request(),
@@ -465,6 +561,7 @@ mod tests {
                     message: "rate limited".to_string(),
                     retry_after_ms: Some(5_000),
                 },
+                match_key: None,
             },
         ]);
 
@@ -487,5 +584,140 @@ mod tests {
                 retry_after: Some(_)
             })
         ));
+    }
+
+    // --- Keyed matching ---
+
+    #[test]
+    fn keyed_entry_matched_before_sequential_regardless_of_position() {
+        // Sequential entry is at index 0, keyed entry (tier=max) is at index 1.
+        // A max-tier request should consume the keyed entry, skipping index 0.
+        let cassette = make_cassette(vec![
+            CassetteEntry {
+                request: make_request(),
+                response: CassetteResponse::Success(make_response("sequential")),
+                match_key: None,
+            },
+            CassetteEntry {
+                request: make_request(),
+                response: CassetteResponse::Success(make_response("keyed")),
+                match_key: Some(EntryMatcher {
+                    tier: Some("max".to_string()),
+                    ..Default::default()
+                }),
+            },
+        ]);
+        let adapter = FixtureAdapter::from_cassette("test", cassette);
+        let req = make_max_request();
+        // Keyed entry consumed first (position 1 skips ahead of position 0)
+        assert_eq!(adapter.complete(&req).unwrap().content, "keyed");
+        // Sequential entry still present
+        assert_eq!(adapter.complete(&req).unwrap().content, "sequential");
+    }
+
+    #[test]
+    fn keyed_fallback_to_sequential_when_no_match() {
+        // Keyed entry requires standard tier; request is max — no match.
+        // Adapter falls back to the sequential entry.
+        let cassette = make_cassette(vec![
+            CassetteEntry {
+                request: make_request(),
+                response: CassetteResponse::Success(make_response("keyed-standard")),
+                match_key: Some(EntryMatcher {
+                    tier: Some("standard".to_string()),
+                    ..Default::default()
+                }),
+            },
+            CassetteEntry {
+                request: make_request(),
+                response: CassetteResponse::Success(make_response("sequential")),
+                match_key: None,
+            },
+        ]);
+        let adapter = FixtureAdapter::from_cassette("test", cassette);
+        let req = make_max_request();
+        // Max request does not match standard keyed entry → sequential fallback
+        assert_eq!(adapter.complete(&req).unwrap().content, "sequential");
+    }
+
+    #[test]
+    fn keyed_exhausted_returns_matching_error() {
+        // Only a keyed entry (standard tier); no sequential fallback.
+        // A max-tier request matches nothing → specific error message.
+        let cassette = make_cassette(vec![CassetteEntry {
+            request: make_request(),
+            response: CassetteResponse::Success(make_response("keyed-standard")),
+            match_key: Some(EntryMatcher {
+                tier: Some("standard".to_string()),
+                ..Default::default()
+            }),
+        }]);
+        let adapter = FixtureAdapter::from_cassette("test", cassette);
+        let req = make_max_request();
+        let err = adapter.complete(&req).unwrap_err();
+        assert!(
+            matches!(&err, AdapterError::ProviderError(msg) if msg.contains("no matching entry"))
+        );
+    }
+
+    #[test]
+    fn all_none_matcher_is_keyed_not_sequential() {
+        // EntryMatcher with all fields None is a keyed entry that matches any request.
+        // It should be consumed ahead of the sequential entry (index 0).
+        let cassette = make_cassette(vec![
+            CassetteEntry {
+                request: make_request(),
+                response: CassetteResponse::Success(make_response("sequential")),
+                match_key: None,
+            },
+            CassetteEntry {
+                request: make_request(),
+                response: CassetteResponse::Success(make_response("all-none-keyed")),
+                match_key: Some(EntryMatcher::default()),
+            },
+        ]);
+        let adapter = FixtureAdapter::from_cassette("test", cassette);
+        let req = make_request();
+        // All-None matcher is keyed and matches any request — consumed first
+        assert_eq!(adapter.complete(&req).unwrap().content, "all-none-keyed");
+        // Sequential entry still available
+        assert_eq!(adapter.complete(&req).unwrap().content, "sequential");
+    }
+
+    #[test]
+    fn mixed_cassette_consumed_in_correct_order() {
+        // Cassette: [sequential, keyed(max), sequential].
+        // max-tier request consumes the keyed entry. Remaining calls use sequential entries.
+        let cassette = make_cassette(vec![
+            CassetteEntry {
+                request: make_request(),
+                response: CassetteResponse::Success(make_response("seq-1")),
+                match_key: None,
+            },
+            CassetteEntry {
+                request: make_request(),
+                response: CassetteResponse::Success(make_response("max-keyed")),
+                match_key: Some(EntryMatcher {
+                    tier: Some("max".to_string()),
+                    ..Default::default()
+                }),
+            },
+            CassetteEntry {
+                request: make_request(),
+                response: CassetteResponse::Success(make_response("seq-2")),
+                match_key: None,
+            },
+        ]);
+        let adapter = FixtureAdapter::from_cassette("test", cassette);
+        // Max-tier request consumes keyed entry at index 1
+        assert_eq!(
+            adapter.complete(&make_max_request()).unwrap().content,
+            "max-keyed"
+        );
+        // Sequential entries consumed in order
+        assert_eq!(adapter.complete(&make_request()).unwrap().content, "seq-1");
+        assert_eq!(adapter.complete(&make_request()).unwrap().content, "seq-2");
+        // Cassette exhausted
+        assert!(adapter.complete(&make_request()).is_err());
     }
 }
