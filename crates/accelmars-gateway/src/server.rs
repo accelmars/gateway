@@ -21,6 +21,7 @@ use accelmars_gateway_core::{
 };
 
 use crate::auth::AuthStore;
+use crate::canary::ShadowQueueSender;
 use crate::concurrency::ConcurrencyLimiter;
 use crate::cost::{CostTracker, RequestRecord};
 use crate::openai::{
@@ -42,6 +43,8 @@ pub struct AppState {
     pub healthy: Arc<AtomicBool>,
     pub start_time: Instant,
     pub port: u16,
+    /// Shadow call queue — Some when at least one canary config has shadow_mode=true.
+    pub shadow_queue: Option<ShadowQueueSender>,
 }
 
 /// Start the gateway on the given port. Blocks until the server shuts down.
@@ -79,6 +82,59 @@ pub async fn serve_with_listener(
     port: u16,
 ) -> anyhow::Result<()> {
     let healthy = Arc::new(AtomicBool::new(true));
+
+    // Spawn shadow worker if any canary config has shadow_mode=true
+    let shadow_queue = if router.config().canary.values().any(|c| c.shadow_mode) {
+        let capacity = router
+            .config()
+            .canary
+            .values()
+            .filter_map(|c| c.shadow_queue_capacity)
+            .max()
+            .unwrap_or(crate::canary::SHADOW_QUEUE_DEFAULT_CAPACITY);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::canary::ShadowTask>(capacity);
+        tokio::spawn(async move {
+            while let Some(task) = rx.recv().await {
+                let provider_name = task.provider_name.clone();
+                let span = tracing::info_span!(
+                    "shadow_call",
+                    "gen_ai.routing.shadow" = true,
+                    "gen_ai.routing.canary_provider" = %provider_name
+                );
+                async {
+                    let adapter = task.adapter.clone();
+                    let req = task.request.clone();
+                    match tokio::task::spawn_blocking(move || adapter.complete(&req)).await {
+                        Ok(Ok(resp)) => {
+                            tracing::info!(
+                                tokens_in = resp.tokens_in,
+                                tokens_out = resp.tokens_out,
+                                provider = %task.provider_name,
+                                content = %resp.content,
+                                "shadow response"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                error = %e,
+                                provider = %task.provider_name,
+                                "shadow call failed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "shadow worker task panicked");
+                        }
+                    }
+                }
+                .instrument(span)
+                .await;
+            }
+        });
+        Some(tx)
+    } else {
+        None
+    };
+
     let state = AppState {
         router,
         limiter,
@@ -88,6 +144,7 @@ pub async fn serve_with_listener(
         healthy: healthy.clone(),
         start_time: Instant::now(),
         port,
+        shadow_queue,
     };
 
     let addr = listener.local_addr()?;
@@ -343,6 +400,55 @@ async fn handle_completion(
 
         let overhead_ms = resolve_start.elapsed().as_millis() as u64;
 
+        // Shadow mode: enqueue a non-blocking shadow call if configured for this tier
+        let tier_key = tier.to_string();
+        if let Some(ref sq) = state.shadow_queue {
+            if let Some(canary_state) = state.router.canary_state_for_tier(&tier_key) {
+                if canary_state.candidate.shadow_mode {
+                    if let Some(adapter) =
+                        state.router.registry_get(&canary_state.candidate.provider)
+                    {
+                        let shadow_task = crate::canary::ShadowTask {
+                            adapter,
+                            request: gateway_req.clone(),
+                            tier,
+                            provider_name: canary_state.candidate.provider.clone(),
+                        };
+                        if let Err(e) = sq.try_send(shadow_task) {
+                            tracing::warn!(
+                                "shadow queue full or closed — dropping shadow task: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Canary span attribute wiring
+        if decision.is_canary {
+            let span = tracing::Span::current();
+            span.set_attribute(crate::telemetry::GEN_AI_ROUTING_CANARY, true);
+            span.set_attribute(
+                crate::telemetry::GEN_AI_ROUTING_CANARY_PROVIDER,
+                decision.provider_name.clone(),
+            );
+            if let Some(cs) = state.router.canary_state_for_tier(&tier_key) {
+                let phase = {
+                    let p = cs.phase.read().expect("canary phase lock poisoned");
+                    match *p {
+                        crate::canary::CanaryPhase::Stable => "stable",
+                        crate::canary::CanaryPhase::Monitoring => "monitoring",
+                        crate::canary::CanaryPhase::RollingBack { .. } => "rolling_back",
+                    }
+                };
+                span.set_attribute(crate::telemetry::GEN_AI_ROUTING_CANARY_PHASE, phase);
+                span.set_attribute(
+                    crate::telemetry::GEN_AI_ROUTING_CANARY_WEIGHT_PCT,
+                    i64::from(cs.candidate.weight_percent.into_inner()),
+                );
+            }
+        }
+
         if is_stream {
             complete_stream(state, decision, tier, gateway_req, key_id, overhead_ms).await
             // _permit dropped here — slot released after streaming completes
@@ -377,6 +483,7 @@ async fn complete_json(
     for attempt in 0..MAX_ATTEMPTS {
         let start = Instant::now();
         let provider_name = current_decision.provider_name.clone();
+        let is_canary = current_decision.is_canary;
         // Arc clone is cheap — adapter is shared behind Arc<dyn ProviderAdapter>
         let adapter = current_decision.adapter.clone();
         let req_clone = gateway_req.clone();
@@ -421,6 +528,9 @@ async fn complete_json(
                     "completion failed"
                 );
                 state.router.on_failure(&provider_name);
+                if is_canary {
+                    state.router.on_canary_result(&tier.to_string(), false);
+                }
                 state.cost_tracker.record(&RequestRecord {
                     id: new_request_id(),
                     timestamp: iso_now(),
@@ -471,6 +581,9 @@ async fn complete_json(
                     "completion ok"
                 );
                 state.router.on_success(&provider_name);
+                if is_canary {
+                    state.router.on_canary_result(&tier.to_string(), true);
+                }
 
                 let (cost_in, cost_out) = state.router.provider_pricing(&provider_name);
                 let cost_usd = CostTracker::calculate_cost(
@@ -588,6 +701,7 @@ async fn complete_stream(
     for attempt in 0..MAX_ATTEMPTS {
         let start = Instant::now();
         let provider_name = current_decision.provider_name.clone();
+        let is_canary = current_decision.is_canary;
         let adapter = current_decision.adapter.clone();
         let req_clone = gateway_req.clone();
 
@@ -616,6 +730,9 @@ async fn complete_stream(
                     "completion failed"
                 );
                 state.router.on_failure(&provider_name);
+                if is_canary {
+                    state.router.on_canary_result(&tier.to_string(), false);
+                }
 
                 // Try to re-resolve via fallback chain
                 if attempt + 1 < MAX_ATTEMPTS {
@@ -641,6 +758,9 @@ async fn complete_stream(
             Ok(Ok(chunked)) => {
                 let total_latency_ms = total_start.elapsed().as_millis() as u64;
                 state.router.on_success(&provider_name);
+                if is_canary {
+                    state.router.on_canary_result(&tier.to_string(), true);
+                }
                 info!(
                     tier = %tier,
                     provider = %provider_name,
