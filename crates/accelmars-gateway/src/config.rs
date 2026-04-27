@@ -146,6 +146,15 @@ impl GatewayConfig {
             }
         }
 
+        // think tier is optional; warn if configured but provider is absent
+        if let Some(ref think_provider) = self.tiers.think {
+            if !self.providers.contains_key(think_provider.as_str()) {
+                warnings.push(format!(
+                    "tier 'think' maps to provider '{think_provider}' which is not configured"
+                ));
+            }
+        }
+
         // Check API key availability
         let mut available_count = 0;
         for (name, provider) in &self.providers {
@@ -206,6 +215,10 @@ pub struct TierConfig {
     pub standard: String,
     pub max: String,
     pub ultra: String,
+    /// Fifth tier: reasoning + context for Forge, Anchor-engine, Guild profiles.
+    /// Schema-only — routing is not yet wired. Use `#[serde(default)]` for backward compat.
+    #[serde(default)]
+    pub think: Option<String>,
 }
 
 impl Default for TierConfig {
@@ -215,6 +228,7 @@ impl Default for TierConfig {
             standard: "deepseek".to_string(),
             max: "claude".to_string(),
             ultra: "claude-opus".to_string(),
+            think: None,
         }
     }
 }
@@ -266,7 +280,7 @@ fn default_timeout() -> u32 {
 /// Constraint-based provider filtering rules.
 ///
 /// All rules are config-driven — the router reads tags, not hardcoded provider names.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ConstraintRules {
     /// Providers excluded when `privacy=sensitive`.
@@ -277,6 +291,24 @@ pub struct ConstraintRules {
     pub low_latency_preferred: Vec<String>,
     /// Providers available when `cost=free` (supplement tag-based filtering).
     pub free_only: Vec<String>,
+}
+
+impl Default for ConstraintRules {
+    fn default() -> Self {
+        Self {
+            // Chinese-hosted providers excluded by default for sensitive data routing.
+            sensitive_excluded: vec![
+                "qwen".to_string(),
+                "stepfun".to_string(),
+                "zhipu".to_string(),
+                "minimax".to_string(),
+                "moonshot".to_string(),
+            ],
+            private_only: Vec::new(),
+            low_latency_preferred: Vec::new(),
+            free_only: Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -374,6 +406,76 @@ free_only = ["gemini"]
     }
 
     #[test]
+    fn think_tier_is_none_by_default() {
+        let cfg = GatewayConfig::from_toml_str("").unwrap();
+        assert!(cfg.tiers.think.is_none());
+    }
+
+    #[test]
+    fn think_tier_deserializes_from_toml() {
+        let toml = "[tiers]\nthink = \"qwen\"";
+        let cfg = GatewayConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.tiers.think.as_deref(), Some("qwen"));
+    }
+
+    #[test]
+    fn validate_passes_with_think_none() {
+        let toml = "mode = \"mock\"";
+        let cfg = GatewayConfig::from_toml_str(toml).unwrap();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_warns_when_think_provider_not_configured() {
+        // Use PATH as api_key_env — always set and non-empty, so available_count > 0.
+        // Think tier maps to "qwen" which is not in providers → must appear in warnings.
+        let toml_full = r#"
+[tiers]
+quick = "gemini"
+standard = "gemini"
+max = "gemini"
+ultra = "gemini"
+think = "qwen"
+
+[providers.gemini]
+api_key_env = "PATH"
+model = "gemini-flash"
+"#;
+        let cfg = GatewayConfig::from_toml_str(toml_full).unwrap();
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("think")),
+            "expected a warning about 'think' tier, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn sensitive_excluded_defaults_include_new_chinese_providers() {
+        let cfg = GatewayConfig::from_toml_str("").unwrap();
+        let excluded = &cfg.constraints.sensitive_excluded;
+        assert!(
+            excluded.contains(&"qwen".to_string()),
+            "qwen must be in sensitive_excluded default"
+        );
+        assert!(
+            excluded.contains(&"stepfun".to_string()),
+            "stepfun must be in sensitive_excluded default"
+        );
+        assert!(
+            excluded.contains(&"zhipu".to_string()),
+            "zhipu must be in sensitive_excluded default"
+        );
+        assert!(
+            excluded.contains(&"minimax".to_string()),
+            "minimax must be in sensitive_excluded default"
+        );
+        assert!(
+            excluded.contains(&"moonshot".to_string()),
+            "moonshot must be in sensitive_excluded default"
+        );
+    }
+
+    #[test]
     fn tier_config_provider_for_tier() {
         use accelmars_gateway_core::ModelTier;
         let tc = TierConfig {
@@ -381,6 +483,7 @@ free_only = ["gemini"]
             standard: "deepseek".to_string(),
             max: "claude".to_string(),
             ultra: "claude-opus".to_string(),
+            think: None,
         };
         assert_eq!(tc.provider_for_tier(ModelTier::Quick), "gemini");
         assert_eq!(tc.provider_for_tier(ModelTier::Standard), "deepseek");
