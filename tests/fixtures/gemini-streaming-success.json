@@ -1,0 +1,41 @@
+{
+  "schema_version": "2",
+  "provider": "gemini",
+  "recorded_at": "2026-04-28T00:00:00Z",
+  "entries": [
+    {
+      "request": {
+        "tier": "quick",
+        "constraints": {
+          "privacy": "open",
+          "latency": "normal",
+          "cost": "default",
+          "capabilities": []
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in three words."
+          }
+        ],
+        "max_tokens": 50,
+        "stream": true,
+        "metadata": {}
+      },
+      "response": {
+        "type": "streaming_success",
+        "id": "gemini-stream-001",
+        "model": "gemini-2.0-flash",
+        "chunks": [
+          "Hello",
+          ", there,",
+          " friend!"
+        ],
+        "tokens_in": 9,
+        "tokens_out": 5,
+        "finish_reason": "stop"
+      },
+      "match_key": null
+    }
+  ]
+}

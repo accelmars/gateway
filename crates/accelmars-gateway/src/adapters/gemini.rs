@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use accelmars_gateway_core::{AdapterError, GatewayRequest, GatewayResponse, ProviderAdapter};
+use accelmars_gateway_core::{
+    AdapterError, ChunkedResponse, GatewayRequest, GatewayResponse, ProviderAdapter,
+};
 
 pub struct GeminiAdapter {
     client: reqwest::Client,
@@ -143,6 +145,77 @@ fn gemini_finish_reason_to_openai(reason: &str) -> &str {
     }
 }
 
+/// Parse a complete Gemini SSE response body into a [`ChunkedResponse`].
+///
+/// Each `data:` line is a JSON-encoded `GeminiResponse` partial chunk.
+/// Content text is collected from every chunk that has it.
+/// Token counts come from the last chunk that includes `usageMetadata`.
+/// Malformed SSE events are silently skipped per the Design Decisions in GI-020.
+pub(crate) fn parse_gemini_stream(
+    body: &str,
+    model: &str,
+) -> Result<ChunkedResponse, AdapterError> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut tokens_in: u32 = 0;
+    let mut tokens_out: u32 = 0;
+    let mut finish_reason = "stop".to_string();
+
+    for line in body.lines() {
+        let data = match line.trim().strip_prefix("data: ") {
+            Some(d) if !d.is_empty() => d,
+            _ => continue,
+        };
+
+        let chunk: GeminiResponse = match serde_json::from_str(data) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        if let Some(candidates) = &chunk.candidates {
+            if let Some(candidate) = candidates.first() {
+                if let Some(text) = candidate
+                    .content
+                    .as_ref()
+                    .and_then(|c| c.parts.as_ref())
+                    .and_then(|parts| parts.first())
+                    .and_then(|p| p.text.as_ref())
+                {
+                    if !text.is_empty() {
+                        chunks.push(text.clone());
+                    }
+                }
+                if let Some(reason) = &candidate.finish_reason {
+                    finish_reason = gemini_finish_reason_to_openai(reason).to_string();
+                }
+            }
+        }
+
+        if let Some(usage) = &chunk.usage_metadata {
+            if let Some(tin) = usage.prompt_token_count {
+                tokens_in = tin;
+            }
+            if let Some(tout) = usage.candidates_token_count {
+                tokens_out = tout;
+            }
+        }
+    }
+
+    if chunks.is_empty() {
+        return Err(AdapterError::ParseError(
+            "no content chunks in Gemini SSE response".to_string(),
+        ));
+    }
+
+    Ok(ChunkedResponse {
+        id: format!("gemini-{}", uuid::Uuid::new_v4()),
+        model: model.to_string(),
+        chunks,
+        tokens_in,
+        tokens_out,
+        finish_reason,
+    })
+}
+
 pub(crate) fn parse_gemini_response(resp: GeminiResponse) -> Result<GatewayResponse, AdapterError> {
     let candidates = resp
         .candidates
@@ -220,6 +293,52 @@ impl ProviderAdapter for GeminiAdapter {
             let mut gw_resp = parse_gemini_response(gemini_resp)?;
             gw_resp.model = self.default_model.clone();
             Ok(gw_resp)
+        })
+    }
+
+    fn complete_chunks(&self, request: &GatewayRequest) -> Result<ChunkedResponse, AdapterError> {
+        self.handle.block_on(async {
+            let api_key = self
+                .api_key
+                .as_deref()
+                .ok_or_else(|| AdapterError::AuthError("GEMINI_API_KEY not set".to_string()))?;
+
+            // streamGenerateContent with SSE output — verified 2026-04-28
+            // https://ai.google.dev/api/generate-content#method:-models.streamgeneratecontent
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
+                self.default_model, api_key
+            );
+
+            let body = build_gemini_request(request);
+
+            let response = self
+                .client
+                .post(&url)
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| {
+                    if e.is_timeout() {
+                        AdapterError::Timeout
+                    } else {
+                        AdapterError::ProviderError(e.to_string())
+                    }
+                })?;
+
+            let status = response.status().as_u16();
+            if status != 200 {
+                let body_text = response.text().await.unwrap_or_default();
+                return Err(super::openai_compat::map_http_error(status, &body_text));
+            }
+
+            let text = response
+                .text()
+                .await
+                .map_err(|e| AdapterError::ProviderError(e.to_string()))?;
+
+            parse_gemini_stream(&text, &self.default_model)
         })
     }
 
@@ -346,5 +465,82 @@ mod tests {
         };
         let err = parse_gemini_response(resp).unwrap_err();
         assert!(matches!(err, AdapterError::ParseError(_)));
+    }
+
+    // --- Streaming: parse_gemini_stream ---
+
+    #[test]
+    fn gemini_streaming_parse_yields_three_chunks() {
+        // Three content chunks; only the last has usageMetadata and finishReason.
+        let sse_body = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}]}}]}\n",
+            "\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\", there\"}]}}]}\n",
+            "\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" world!\"}]},\"finishReason\":\"STOP\"}],",
+            "\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":5}}\n",
+        );
+        let result = parse_gemini_stream(sse_body, "gemini-2.0-flash").unwrap();
+        assert_eq!(result.chunks.len(), 3);
+        assert_eq!(result.chunks[0], "Hello");
+        assert_eq!(result.chunks[1], ", there");
+        assert_eq!(result.chunks[2], " world!");
+        assert!(result.tokens_in > 0, "tokens_in should be non-zero");
+        assert!(result.tokens_out > 0, "tokens_out should be non-zero");
+        assert_eq!(result.tokens_in, 7);
+        assert_eq!(result.tokens_out, 5);
+        assert_eq!(result.finish_reason, "stop");
+        assert_eq!(result.model, "gemini-2.0-flash");
+    }
+
+    #[test]
+    fn gemini_streaming_parse_skips_malformed_events() {
+        let sse_body = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}]}}]}\n",
+            "\n",
+            "data: not-valid-json\n",
+            "\n",
+            ": comment line ignored\n",
+            "\n",
+            "event: meta\n",
+            "\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" world\"}]},\"finishReason\":\"STOP\"}],",
+            "\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":3}}\n",
+        );
+        let result = parse_gemini_stream(sse_body, "gemini-2.0-flash").unwrap();
+        assert_eq!(result.chunks, vec!["Hello", " world"]);
+        assert_eq!(result.finish_reason, "stop");
+        assert_eq!(result.tokens_in, 5);
+        assert_eq!(result.tokens_out, 3);
+    }
+
+    #[test]
+    fn gemini_streaming_parse_empty_body_returns_parse_error() {
+        let result = parse_gemini_stream("", "gemini-2.0-flash");
+        assert!(matches!(result, Err(AdapterError::ParseError(_))));
+    }
+
+    #[test]
+    fn gemini_streaming_parse_maps_max_tokens_finish_reason() {
+        let sse_body = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"truncated\"}]},\"finishReason\":\"MAX_TOKENS\"}],",
+            "\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":100}}\n",
+        );
+        let result = parse_gemini_stream(sse_body, "gemini-2.0-flash").unwrap();
+        assert_eq!(result.finish_reason, "length");
+        assert_eq!(result.chunks, vec!["truncated"]);
+    }
+
+    #[test]
+    fn gemini_streaming_parse_empty_text_parts_excluded() {
+        // Empty string parts should not add to chunks — only non-empty text included.
+        let sse_body = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}]}}]}\n",
+            "\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"real\"}]},\"finishReason\":\"STOP\"}],",
+            "\"usageMetadata\":{\"promptTokenCount\":4,\"candidatesTokenCount\":2}}\n",
+        );
+        let result = parse_gemini_stream(sse_body, "gemini-2.0-flash").unwrap();
+        assert_eq!(result.chunks, vec!["real"]);
     }
 }
