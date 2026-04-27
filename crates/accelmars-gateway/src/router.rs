@@ -629,6 +629,7 @@ mod tests {
                 standard: "deepseek".to_string(),
                 max: "claude".to_string(),
                 ultra: "claude".to_string(),
+                think: None,
             },
             providers,
             constraints: ConstraintRules {
