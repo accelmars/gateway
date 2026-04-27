@@ -8,7 +8,7 @@ All notable changes to this project will be documented in this file.
 
 - Cassette recording and replay — integration tests replay provider responses from fixture files without real API keys ([#21](https://github.com/accelmars/gateway/pull/21))
 - Agent-consumable CLI — `gateway status` exit codes (0/1/2), `--json` mode, PID-file port discovery, per-request routing constraint flags on `complete`, and `gateway stop` ([#22](https://github.com/accelmars/gateway/pull/22))
-- API key authentication — Bearer token validation, SHA-256 hashed SQLite key store, and `gateway keys create/list/revoke` CLI commands ([#24](https://github.com/accelmars/gateway/pull/24))
+- API key authentication — SHA-256 hashed SQLite key store, `Authorization` header enforcement, and `gateway keys create/list/revoke` CLI commands ([#24](https://github.com/accelmars/gateway/pull/24))
 - Fly.io cloud deployment — persistent SQLite volume, auto-stop on idle, health checks on `/health`, and GitHub Actions auto-deploy on merge to main ([#25](https://github.com/accelmars/gateway/pull/25))
 - Circuit breaker and fallback retry — CLOSED/OPEN/HALF-OPEN state machine with 3-failure threshold, 30-second recovery window, and server-side retry across the fallback chain; circuit state visible on `/status` ([#27](https://github.com/accelmars/gateway/pull/27))
 - OpenTelemetry observability — GenAI semantic convention spans on every request, conditional OTLP export to Grafana Cloud, fail-open guarantee, and gateway overhead measurement ([#28](https://github.com/accelmars/gateway/pull/28))
