@@ -3,6 +3,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::canary::CandidateConfig;
+
 /// Top-level gateway configuration.
 ///
 /// Loaded from (in order, later sources override earlier):
@@ -22,6 +24,11 @@ pub struct GatewayConfig {
     pub tiers: TierConfig,
     pub providers: HashMap<String, ProviderConfig>,
     pub constraints: ConstraintRules,
+    /// Canary routing configuration — optional per-tier.
+    /// Key: tier name ("quick", "standard", "max", "ultra").
+    /// Absent key = no canary for that tier.
+    #[serde(default)]
+    pub canary: HashMap<String, CandidateConfig>,
 }
 
 impl Default for GatewayConfig {
@@ -35,6 +42,7 @@ impl Default for GatewayConfig {
             tiers: TierConfig::default(),
             providers: HashMap::new(),
             constraints: ConstraintRules::default(),
+            canary: HashMap::new(),
         }
     }
 }

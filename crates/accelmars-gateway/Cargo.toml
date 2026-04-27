@@ -38,7 +38,8 @@ tracing-opentelemetry = { version = "0.32", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
-rand = "0.8"
+rand = { version = "0.8", features = ["small_rng"] }
+nutype = { version = "0.5", features = ["serde"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

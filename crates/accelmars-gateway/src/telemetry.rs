@@ -41,6 +41,17 @@ pub const GATEWAY_OVERHEAD_MS: &str = "gateway.overhead_ms";
 pub const GATEWAY_FALLBACK: &str = "gateway.fallback";
 pub const GATEWAY_ENGINE: &str = "gateway.engine";
 
+// ---------------------------------------------------------------------------
+// Canary routing attributes (gen_ai.routing.*)
+// ---------------------------------------------------------------------------
+
+pub const GEN_AI_ROUTING_CANARY: &str = "gen_ai.routing.canary";
+pub const GEN_AI_ROUTING_CANARY_PROVIDER: &str = "gen_ai.routing.canary_provider";
+pub const GEN_AI_ROUTING_SHADOW: &str = "gen_ai.routing.shadow";
+pub const GEN_AI_ROUTING_CANARY_PHASE: &str = "gen_ai.routing.canary_phase";
+pub const GEN_AI_ROUTING_CANARY_WEIGHT_PCT: &str = "gen_ai.routing.canary_weight_pct";
+pub const GEN_AI_ROUTING_CANARY_WINDOW_ERROR_RATE: &str = "gen_ai.routing.canary_window_error_rate";
+
 /// Initialize the tracing subscriber with optional OpenTelemetry export.
 ///
 /// Returns the [`SdkTracerProvider`] handle when OTel is active (needed for

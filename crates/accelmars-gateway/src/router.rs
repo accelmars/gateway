@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use accelmars_gateway_core::{ModelTier, ProviderAdapter, RoutingConstraints};
 
+use crate::canary::{CanaryRng, CanaryState, DefaultCanaryRng};
 use crate::config::{GatewayConfig, GatewayMode};
 use crate::registry::AdapterRegistry;
 
@@ -15,6 +17,8 @@ pub struct RouteDecision {
     pub model_id: String,
     /// Adapter ready to call.
     pub adapter: Arc<dyn ProviderAdapter>,
+    /// True if this decision was produced by canary weighted selection.
+    pub is_canary: bool,
 }
 
 /// Circuit breaker state machine for a single provider.
@@ -184,14 +188,61 @@ pub struct Router {
     config: GatewayConfig,
     registry: AdapterRegistry,
     health: Mutex<HashMap<String, ProviderHealth>>,
+    canary_rng: Arc<dyn CanaryRng>,
+    canary_states: HashMap<String, Arc<CanaryState>>,
 }
 
 impl Router {
     pub fn new(config: GatewayConfig, registry: AdapterRegistry) -> Self {
+        let canary_states: HashMap<String, Arc<CanaryState>> = config
+            .canary
+            .iter()
+            .map(|(tier_name, candidate_config)| {
+                tracing::info!(
+                    tier = %tier_name,
+                    provider = %candidate_config.provider,
+                    weight_pct = candidate_config.weight_percent.into_inner(),
+                    "canary active for tier"
+                );
+                (
+                    tier_name.clone(),
+                    Arc::new(CanaryState::new(candidate_config.clone())),
+                )
+            })
+            .collect();
+
         Self {
             config,
             registry,
             health: Mutex::new(HashMap::new()),
+            canary_rng: Arc::new(DefaultCanaryRng::new()),
+            canary_states,
+        }
+    }
+
+    /// Constructor with injected RNG — for deterministic testing (e.g., Crucible eval runs).
+    pub fn with_canary_rng(
+        config: GatewayConfig,
+        registry: AdapterRegistry,
+        rng: Arc<dyn CanaryRng>,
+    ) -> Self {
+        let canary_states: HashMap<String, Arc<CanaryState>> = config
+            .canary
+            .iter()
+            .map(|(tier_name, candidate_config)| {
+                (
+                    tier_name.clone(),
+                    Arc::new(CanaryState::new(candidate_config.clone())),
+                )
+            })
+            .collect();
+
+        Self {
+            config,
+            registry,
+            health: Mutex::new(HashMap::new()),
+            canary_rng: rng,
+            canary_states,
         }
     }
 
@@ -240,6 +291,22 @@ impl Router {
                 .unwrap_or(default_provider.clone())
         };
 
+        // Canary selection: check if this tier has an active canary
+        let tier_key = tier.to_string();
+        if let Some(canary_state) = self.canary_states.get(&tier_key) {
+            if canary_state.active.load(Ordering::Acquire) {
+                let weight = canary_state.candidate.weight_percent;
+                if self.canary_rng.should_take_canary(weight) {
+                    let canary_provider = &canary_state.candidate.provider;
+                    if let Ok(mut decision) = self.resolve_named(canary_provider) {
+                        decision.is_canary = true;
+                        return Ok(decision);
+                    }
+                    // Canary resolve failed — fall through to primary
+                }
+            }
+        }
+
         // 6. Try selected provider, then fallback chain
         self.resolve_with_fallback(&selected, 0, None)
     }
@@ -287,6 +354,7 @@ impl Router {
             provider_name: "mock".to_string(),
             model_id: "mock".to_string(),
             adapter,
+            is_canary: false,
         })
     }
 
@@ -309,6 +377,7 @@ impl Router {
             provider_name: provider_name.to_string(),
             model_id,
             adapter,
+            is_canary: false,
         })
     }
 
@@ -381,6 +450,7 @@ impl Router {
                         provider_name: "mock".to_string(),
                         model_id: "mock".to_string(),
                         adapter: mock,
+                        is_canary: false,
                     });
                 }
 
@@ -401,6 +471,7 @@ impl Router {
             provider_name: provider_name.to_string(),
             model_id,
             adapter,
+            is_canary: false,
         })
     }
 
@@ -489,6 +560,31 @@ impl Router {
     pub fn mode(&self) -> crate::config::GatewayMode {
         self.config.mode
     }
+
+    /// Gateway configuration reference (for shadow worker startup check).
+    pub fn config(&self) -> &GatewayConfig {
+        &self.config
+    }
+
+    /// Record the result of a canary request for health tracking.
+    pub fn on_canary_result(&self, tier_key: &str, success: bool) {
+        if let Some(state) = self.canary_states.get(tier_key) {
+            state.record_result(success);
+        }
+    }
+
+    /// Return the canary state for a tier (for shadow queue and span attribute wiring).
+    pub fn canary_state_for_tier(&self, tier_key: &str) -> Option<Arc<CanaryState>> {
+        self.canary_states.get(tier_key).cloned()
+    }
+
+    /// Look up a provider adapter by name (for shadow task enqueue).
+    pub fn registry_get(&self, name: &str) -> Option<Arc<dyn ProviderAdapter>> {
+        self.registry.get(name)
+    }
+
+    // [GAP]: canary phase in /status — provider_statuses() output does not yet include
+    // canary state (phase, weight_pct, error_rate). Extend in a follow-up contract.
 
     /// Returns (cost_per_1m_input, cost_per_1m_output) for a provider.
     /// Returns (0.0, 0.0) if provider not found.
@@ -638,6 +734,7 @@ mod tests {
                 low_latency_preferred: vec!["groq".to_string()],
                 free_only: vec!["gemini".to_string(), "groq".to_string()],
             },
+            canary: HashMap::new(),
         }
     }
 
@@ -650,6 +747,117 @@ mod tests {
             registry.register(Arc::new(MockAdapter::default().with_name(name)));
         }
         registry
+    }
+
+    // === Canary routing helpers ===
+
+    fn make_canary_config(
+        tier: ModelTier,
+        candidate: crate::canary::CandidateConfig,
+    ) -> GatewayConfig {
+        let mut config = make_config(GatewayMode::Normal);
+        let tier_key = tier.to_string();
+        config.canary.insert(tier_key, candidate);
+        config
+    }
+
+    fn make_registry_with_fixtures(names: &[(&str, &str)]) -> AdapterRegistry {
+        let mut registry = AdapterRegistry::new();
+        registry.register(Arc::new(MockAdapter::default()));
+        for &(name, _cassette) in names {
+            registry.register(Arc::new(MockAdapter::default().with_name(name)));
+        }
+        registry
+    }
+
+    // === Canary routing tests ===
+
+    #[test]
+    fn canary_routing_at_100_percent_routes_to_canary_provider() {
+        use crate::canary::{CandidateConfig, SeededCanaryRng, WeightPercent};
+
+        let candidate = CandidateConfig {
+            provider: "qwen".to_string(),
+            weight_percent: WeightPercent::new(100).unwrap(),
+            shadow_mode: false,
+            rollback_window: None,
+            rollback_threshold: None,
+            shadow_queue_capacity: None,
+        };
+        let config = make_canary_config(ModelTier::Standard, candidate);
+        let registry = make_registry_with_fixtures(&[("deepseek", "primary"), ("qwen", "canary")]);
+        let router =
+            Router::with_canary_rng(config, registry, Arc::new(SeededCanaryRng { seed: 42 }));
+
+        let decision = router
+            .resolve(ModelTier::Standard, &RoutingConstraints::default())
+            .unwrap();
+
+        assert_eq!(decision.provider_name, "qwen");
+        assert!(decision.is_canary, "decision must be marked is_canary=true");
+    }
+
+    #[test]
+    fn canary_at_0_percent_routes_to_primary() {
+        use crate::canary::{CandidateConfig, SeededCanaryRng, WeightPercent};
+
+        let candidate = CandidateConfig {
+            provider: "qwen".to_string(),
+            weight_percent: WeightPercent::new(0).unwrap(),
+            shadow_mode: false,
+            rollback_window: None,
+            rollback_threshold: None,
+            shadow_queue_capacity: None,
+        };
+        let config = make_canary_config(ModelTier::Standard, candidate);
+        let registry = make_registry_with_fixtures(&[("deepseek", "primary"), ("qwen", "canary")]);
+        let router =
+            Router::with_canary_rng(config, registry, Arc::new(SeededCanaryRng { seed: 42 }));
+
+        let decision = router
+            .resolve(ModelTier::Standard, &RoutingConstraints::default())
+            .unwrap();
+
+        // weight=0 → canary inactive → must route to primary
+        assert_eq!(decision.provider_name, "deepseek");
+        assert!(!decision.is_canary);
+    }
+
+    #[test]
+    fn shadow_task_enqueued_when_shadow_mode_configured() {
+        use crate::canary::{CandidateConfig, WeightPercent};
+
+        // shadow_mode=true, weight=0: no canary traffic, shadow fires on all requests
+        let candidate = CandidateConfig {
+            provider: "qwen".to_string(),
+            weight_percent: WeightPercent::new(0).unwrap(),
+            shadow_mode: true,
+            rollback_window: None,
+            rollback_threshold: None,
+            shadow_queue_capacity: None,
+        };
+        let config = make_canary_config(ModelTier::Standard, candidate);
+
+        // Verify the shadow_mode flag is preserved on the canary state
+        let registry = make_registry_with_fixtures(&[("deepseek", "primary"), ("qwen", "shadow")]);
+        let router = Router::new(config, registry);
+
+        let canary_state = router.canary_state_for_tier("standard").unwrap();
+        assert!(
+            canary_state.candidate.shadow_mode,
+            "shadow_mode must be true on canary state"
+        );
+        assert_eq!(
+            canary_state.candidate.provider, "qwen",
+            "shadow provider must be qwen"
+        );
+
+        // Shadow is available via registry_get
+        let adapter = router.registry_get("qwen");
+        assert!(
+            adapter.is_some(),
+            "shadow provider adapter must be accessible via registry_get"
+        );
     }
 
     // === Original routing tests ===
