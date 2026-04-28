@@ -1,0 +1,41 @@
+{
+  "schema_version": "2",
+  "provider": "claude",
+  "recorded_at": "2026-04-28T00:00:00Z",
+  "entries": [
+    {
+      "request": {
+        "tier": "max",
+        "constraints": {
+          "privacy": "open",
+          "latency": "normal",
+          "cost": "default",
+          "capabilities": []
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in three words."
+          }
+        ],
+        "max_tokens": 50,
+        "stream": true,
+        "metadata": {}
+      },
+      "response": {
+        "type": "streaming_success",
+        "id": "msg_claude001",
+        "model": "claude-sonnet-4-6",
+        "chunks": [
+          "Hello",
+          ", there,",
+          " friend!"
+        ],
+        "tokens_in": 12,
+        "tokens_out": 6,
+        "finish_reason": "stop"
+      },
+      "match_key": null
+    }
+  ]
+}

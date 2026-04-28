@@ -3,7 +3,9 @@ use std::time::Duration;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 
-use accelmars_gateway_core::{AdapterError, GatewayRequest, GatewayResponse, ProviderAdapter};
+use accelmars_gateway_core::{
+    AdapterError, ChunkedResponse, GatewayRequest, GatewayResponse, ProviderAdapter,
+};
 
 /// Shared adapter for providers that speak the OpenAI chat completions format natively.
 /// DeepSeek, OpenRouter, and Groq all use this — near-passthrough with auth differences.
@@ -139,6 +141,149 @@ pub(crate) fn map_http_error(status: u16, body: &str) -> AdapterError {
     }
 }
 
+#[derive(Deserialize)]
+pub(crate) struct OaiStreamChunk {
+    pub id: Option<String>,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub choices: Vec<OaiStreamChoice>,
+    pub usage: Option<OaiStreamUsage>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct OaiStreamChoice {
+    pub delta: OaiStreamDelta,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct OaiStreamDelta {
+    pub content: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct OaiStreamUsage {
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+}
+
+pub(crate) fn parse_oai_sse_stream(
+    body: &str,
+    adapter_name: &str,
+) -> Result<ChunkedResponse, AdapterError> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut tokens_in: u32 = 0;
+    let mut tokens_out: u32 = 0;
+    let mut finish_reason = "stop".to_string();
+    let mut response_id = format!("{adapter_name}-unknown");
+    let mut model = adapter_name.to_string();
+
+    for line in body.lines() {
+        let data = match line.trim().strip_prefix("data: ") {
+            Some(d) if !d.is_empty() => d,
+            _ => continue,
+        };
+
+        if data == "[DONE]" {
+            break;
+        }
+
+        let chunk: OaiStreamChunk = match serde_json::from_str(data) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        if let Some(id) = chunk.id {
+            response_id = id;
+        }
+        if let Some(m) = chunk.model {
+            model = m;
+        }
+
+        if let Some(choice) = chunk.choices.first() {
+            if let Some(content) = &choice.delta.content {
+                if !content.is_empty() {
+                    chunks.push(content.clone());
+                }
+            }
+            if let Some(reason) = &choice.finish_reason {
+                finish_reason = reason.clone();
+            }
+        }
+
+        if let Some(usage) = chunk.usage {
+            if let Some(tin) = usage.prompt_tokens {
+                tokens_in = tin;
+            }
+            if let Some(tout) = usage.completion_tokens {
+                tokens_out = tout;
+            }
+        }
+    }
+
+    if chunks.is_empty() {
+        return Err(AdapterError::ParseError(
+            "no content chunks in OAI SSE response".to_string(),
+        ));
+    }
+
+    Ok(ChunkedResponse {
+        id: response_id,
+        model,
+        chunks,
+        tokens_in,
+        tokens_out,
+        finish_reason,
+    })
+}
+
+pub(crate) async fn complete_chunks_oai_sse(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+    extra_headers: &HeaderMap,
+    request: &GatewayRequest,
+    model: &str,
+    adapter_name: &str,
+) -> Result<ChunkedResponse, AdapterError> {
+    let mut body = build_oai_request(request, model);
+    body.stream = true;
+
+    let mut req_builder = client
+        .post(url)
+        .header(CONTENT_TYPE, "application/json")
+        .json(&body);
+
+    if let Some(key) = api_key {
+        req_builder = req_builder.header(AUTHORIZATION, format!("Bearer {key}"));
+    }
+
+    for (name, value) in extra_headers.iter() {
+        req_builder = req_builder.header(name, value);
+    }
+
+    let response = req_builder.send().await.map_err(|e| {
+        if e.is_timeout() {
+            AdapterError::Timeout
+        } else {
+            AdapterError::ProviderError(e.to_string())
+        }
+    })?;
+
+    let status = response.status().as_u16();
+    if status != 200 {
+        let body_text = response.text().await.unwrap_or_default();
+        return Err(map_http_error(status, &body_text));
+    }
+
+    let text = response
+        .text()
+        .await
+        .map_err(|e| AdapterError::ProviderError(e.to_string()))?;
+
+    parse_oai_sse_stream(&text, adapter_name)
+}
+
 impl ProviderAdapter for OpenAiCompatibleAdapter {
     fn name(&self) -> &str {
         &self.adapter_name
@@ -185,6 +330,18 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
         })
     }
 
+    fn complete_chunks(&self, request: &GatewayRequest) -> Result<ChunkedResponse, AdapterError> {
+        self.handle.block_on(complete_chunks_oai_sse(
+            &self.client,
+            &self.base_url,
+            self.api_key.as_deref(),
+            &self.extra_headers,
+            request,
+            &self.default_model,
+            &self.adapter_name,
+        ))
+    }
+
     fn is_available(&self) -> bool {
         self.api_key.is_some()
     }
@@ -192,8 +349,103 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use accelmars_gateway_core::{Message, ModelTier, RoutingConstraints};
+
+    use super::super::fixture::FixtureAdapter;
+
+    fn make_streaming_request() -> GatewayRequest {
+        GatewayRequest {
+            tier: ModelTier::Standard,
+            constraints: RoutingConstraints::default(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "Say hello in three words.".to_string(),
+            }],
+            max_tokens: Some(50),
+            stream: true,
+            metadata: Default::default(),
+        }
+    }
+
+    #[test]
+    fn deepseek_streaming_parse_yields_three_chunks() {
+        let sse_body = concat!(
+            "data: {\"id\":\"chatcmpl-001\",\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n",
+            "\n",
+            "data: {\"id\":\"chatcmpl-001\",\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"content\":\", there,\"},\"finish_reason\":null}]}\n",
+            "\n",
+            "data: {\"id\":\"chatcmpl-001\",\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"content\":\" world!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":5}}\n",
+            "\n",
+            "data: [DONE]\n",
+        );
+        let result = parse_oai_sse_stream(sse_body, "deepseek").unwrap();
+        assert_eq!(result.chunks.len(), 3);
+        assert_eq!(result.chunks[0], "Hello");
+        assert_eq!(result.chunks[1], ", there,");
+        assert_eq!(result.chunks[2], " world!");
+        assert_eq!(result.tokens_in, 9);
+        assert_eq!(result.tokens_out, 5);
+        assert_eq!(result.finish_reason, "stop");
+        assert_eq!(result.model, "deepseek-chat");
+    }
+
+    #[test]
+    fn deepseek_streaming_parse_skips_malformed_events() {
+        let sse_body = concat!(
+            "data: {\"id\":\"chatcmpl-001\",\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n",
+            "\n",
+            "data: not-valid-json\n",
+            "\n",
+            ": comment line ignored\n",
+            "\n",
+            "data: {\"id\":\"chatcmpl-001\",\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n",
+            "\n",
+            "data: [DONE]\n",
+        );
+        let result = parse_oai_sse_stream(sse_body, "deepseek").unwrap();
+        assert_eq!(result.chunks, vec!["Hello", " world"]);
+        assert_eq!(result.finish_reason, "stop");
+        assert_eq!(result.tokens_in, 5);
+        assert_eq!(result.tokens_out, 3);
+    }
+
+    #[test]
+    fn deepseek_streaming_parse_empty_body_returns_parse_error() {
+        let result = parse_oai_sse_stream("", "deepseek");
+        assert!(matches!(result, Err(AdapterError::ParseError(_))));
+    }
+
+    #[test]
+    fn deepseek_streaming_parse_skips_empty_content_role_chunk() {
+        let sse_body = concat!(
+            "data: {\"id\":\"chatcmpl-001\",\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n",
+            "\n",
+            "data: {\"id\":\"chatcmpl-001\",\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"content\":\"real\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2}}\n",
+            "\n",
+            "data: [DONE]\n",
+        );
+        let result = parse_oai_sse_stream(sse_body, "deepseek").unwrap();
+        assert_eq!(result.chunks, vec!["real"]);
+    }
+
+    #[test]
+    fn deepseek_streaming_cassette_complete_chunks_yields_three_deltas() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/deepseek-streaming-success.json");
+        let adapter = FixtureAdapter::from_file("deepseek", &path).unwrap();
+        let req = make_streaming_request();
+        let result = adapter.complete_chunks(&req).unwrap();
+        assert!(
+            result.chunks.len() >= 3,
+            "expected ≥3 content deltas, got {}",
+            result.chunks.len()
+        );
+        assert!(result.tokens_in > 0, "tokens_in must be > 0");
+        assert!(result.tokens_out > 0, "tokens_out must be > 0");
+    }
 
     fn test_request() -> GatewayRequest {
         GatewayRequest {
