@@ -116,6 +116,12 @@ enum Commands {
         #[command(subcommand)]
         action: KeysAction,
     },
+    /// Run a live demo of AccelMars Gateway in mock mode.
+    /// No API key or configuration needed.
+    ///
+    /// Sends a test message through Quick, Standard, and Max tiers,
+    /// streams responses, and prints a comparison summary.
+    Demo,
 }
 
 #[derive(Subcommand)]
@@ -481,6 +487,13 @@ async fn main() {
                     let exit_code = cli::keys::revoke(&auth_store, &prefix, dry_run, yes);
                     std::process::exit(exit_code);
                 }
+            }
+        }
+
+        Some(Commands::Demo) => {
+            if let Err(e) = cli::demo::run().await {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
             }
         }
 
