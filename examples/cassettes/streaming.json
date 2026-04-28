@@ -1,0 +1,28 @@
+{
+  "schema_version": "2",
+  "provider": "mock",
+  "recorded_at": "2026-04-28T00:00:00Z",
+  "entries": [
+    {
+      "request": {
+        "tier": "standard",
+        "messages": [
+          {"role": "user", "content": "Count to 5, one number per line."}
+        ],
+        "max_tokens": null,
+        "stream": true,
+        "constraints": {},
+        "metadata": {}
+      },
+      "response": {
+        "type": "streaming_success",
+        "id": "fixture-2",
+        "model": "deepseek-chat",
+        "chunks": ["1\n", "2\n", "3\n", "4\n", "5\n"],
+        "tokens_in": 20,
+        "tokens_out": 10,
+        "finish_reason": "stop"
+      }
+    }
+  ]
+}
