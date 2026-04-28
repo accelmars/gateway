@@ -3,7 +3,10 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use accelmars_gateway_core::{ModelTier, ProviderAdapter, RoutingConstraints};
+use accelmars_gateway_core::{
+    routing::{ProviderInfo, RoutingStrategy, TierRouter},
+    GatewayRequest, ModelTier, ProviderAdapter, RoutingConstraints,
+};
 
 use crate::canary::{CanaryRng, CanaryState, DefaultCanaryRng};
 use crate::config::{GatewayConfig, GatewayMode};
@@ -190,6 +193,7 @@ pub struct Router {
     health: Mutex<HashMap<String, ProviderHealth>>,
     canary_rng: Arc<dyn CanaryRng>,
     canary_states: HashMap<String, Arc<CanaryState>>,
+    strategy: Box<dyn RoutingStrategy + Send + Sync>,
 }
 
 impl Router {
@@ -217,6 +221,7 @@ impl Router {
             health: Mutex::new(HashMap::new()),
             canary_rng: Arc::new(DefaultCanaryRng::new()),
             canary_states,
+            strategy: Box::new(TierRouter),
         }
     }
 
@@ -243,6 +248,7 @@ impl Router {
             health: Mutex::new(HashMap::new()),
             canary_rng: rng,
             canary_states,
+            strategy: Box::new(TierRouter),
         }
     }
 
@@ -270,25 +276,51 @@ impl Router {
             return self.resolve_named(provider_name);
         }
 
-        // 3. Get default provider for tier
+        // 3. Determine effective candidate list (default first if constraints allow it)
         let default_provider = self.config.tiers.provider_for_tier(tier).to_string();
-
-        // 4-5. Apply constraint filters to find candidate set
         let candidates = self.apply_constraints(tier, constraints);
-
-        // Select from candidates, falling back to default if needed
-        let selected = if candidates.is_empty() {
-            // No filtered candidates — try the tier default directly
-            default_provider.clone()
+        let effective_candidates: Vec<String> = if candidates.is_empty() {
+            vec![default_provider.clone()]
         } else if candidates.contains(&default_provider) {
-            // Default is valid within constraints
-            default_provider.clone()
+            let mut v = vec![default_provider.clone()];
+            v.extend(candidates.into_iter().filter(|c| c != &default_provider));
+            v
         } else {
-            // Default excluded by constraints — pick first healthy candidate
             candidates
-                .into_iter()
-                .find(|name| self.provider_is_healthy(name))
-                .unwrap_or(default_provider.clone())
+        };
+
+        // 4. Assemble ProviderInfo: read circuit state (peek, no side effects), then release lock
+        let provider_infos: Vec<ProviderInfo> = {
+            let health = self.health.lock().expect("health lock poisoned");
+            effective_candidates
+                .iter()
+                .map(|name| {
+                    let not_open = health
+                        .get(name.as_str())
+                        .map(|h| h.state != CircuitState::Open)
+                        .unwrap_or(true);
+                    let adapter_ok = self
+                        .registry
+                        .get(name)
+                        .map(|a| a.is_available())
+                        .unwrap_or(false);
+                    ProviderInfo::new(name.clone(), tier, not_open && adapter_ok)
+                })
+                .collect()
+        }; // health lock released here
+
+        // 5. Delegate to strategy — build minimal request (tier + constraints only)
+        let route_req = GatewayRequest {
+            tier,
+            constraints: constraints.clone(),
+            messages: vec![],
+            max_tokens: None,
+            stream: false,
+            metadata: Default::default(),
+        };
+        let selected = match self.strategy.select_provider(&route_req, &provider_infos) {
+            Ok(name) => name,
+            Err(_) => default_provider.clone(),
         };
 
         // Canary selection: check if this tier has an active canary

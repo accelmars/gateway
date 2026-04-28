@@ -1,5 +1,7 @@
 pub mod adapter;
+pub mod metadata;
 pub mod mock;
+pub mod routing;
 pub mod types;
 
 pub use adapter::{AdapterError, ProviderAdapter};
