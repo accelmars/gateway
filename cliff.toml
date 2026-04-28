@@ -16,7 +16,7 @@ body = """
 {% for commit in commits -%}
 - {% if commit.scope %}(**{{ commit.scope }}**) {% endif %}\
 {% if commit.breaking %}[**BREAKING**] {% endif %}\
-{{ commit.message | upper_first | regex_replace(pattern=" \\\\(#\\\\d+\\\\)$", replacement="") }}\
+{{ commit.message | upper_first }}\
 {% if commit.links %} ([{{ commit.links | map(attribute="text") | join(sep=", ") }}]({{ commit.links | first | get(key="href") }})){% endif %}
 {% endfor %}
 {% endfor %}
