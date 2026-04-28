@@ -1,4 +1,5 @@
 pub mod complete;
+pub mod demo;
 pub mod keys;
 pub mod stats;
 pub mod status;
