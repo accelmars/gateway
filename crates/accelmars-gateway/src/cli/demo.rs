@@ -25,18 +25,21 @@ pub async fn run() -> anyhow::Result<()> {
 
     let tiers: &[(ModelTier, Duration, &'static str)] = &[
         (ModelTier::Quick, Duration::from_millis(60), "quick-mock-v1"),
-        (ModelTier::Standard, Duration::from_millis(180), "standard-mock-v1"),
+        (
+            ModelTier::Standard,
+            Duration::from_millis(180),
+            "standard-mock-v1",
+        ),
         (ModelTier::Max, Duration::from_millis(400), "max-mock-v1"),
     ];
 
     let mut results: Vec<TierResult> = Vec::new();
 
     for &(tier, latency, model) in tiers {
-        let response_content =
-            "I am AccelMars Gateway — a Rust-native, multi-provider AI router. \
+        let response_content = "I am AccelMars Gateway — a Rust-native, multi-provider AI router. \
              In production I route to the best available provider for your quality tier. \
              Zero-key local dev. Deterministic CI cassettes. 13 providers. Streaming native."
-                .to_string();
+            .to_string();
 
         let adapter = MockAdapter::new(response_content)
             .with_latency(latency)
@@ -72,10 +75,18 @@ pub async fn run() -> anyhow::Result<()> {
         println!();
         println!("   ↳ {latency_ms} ms | {tokens_out} tokens out\n");
 
-        results.push(TierResult { tier, model, tokens_out, latency_ms });
+        results.push(TierResult {
+            tier,
+            model,
+            tokens_out,
+            latency_ms,
+        });
     }
 
-    println!("{:<12} {:<18} {:>8} {:>10}", "Tier", "Model selected", "Tokens", "Latency");
+    println!(
+        "{:<12} {:<18} {:>8} {:>10}",
+        "Tier", "Model selected", "Tokens", "Latency"
+    );
     println!("{}", "-".repeat(52));
     for r in &results {
         println!(
