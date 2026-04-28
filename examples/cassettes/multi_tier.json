@@ -1,0 +1,70 @@
+{
+  "schema_version": "1",
+  "provider": "mock",
+  "recorded_at": "2026-04-28T00:00:00Z",
+  "entries": [
+    {
+      "request": {
+        "tier": "quick",
+        "messages": [
+          {"role": "user", "content": "Summarize the theory of relativity in one sentence."}
+        ],
+        "max_tokens": null,
+        "stream": false,
+        "constraints": {},
+        "metadata": {}
+      },
+      "response": {
+        "type": "success",
+        "id": "fixture-4",
+        "model": "gemini-2.5-flash-lite",
+        "content": "Einstein's theory of relativity establishes that the laws of physics are the same for all non-accelerating observers, and that the speed of light in a vacuum is constant regardless of the motion of the source.",
+        "tokens_in": 20,
+        "tokens_out": 42,
+        "finish_reason": "stop"
+      }
+    },
+    {
+      "request": {
+        "tier": "standard",
+        "messages": [
+          {"role": "user", "content": "Summarize the theory of relativity in one sentence."}
+        ],
+        "max_tokens": null,
+        "stream": false,
+        "constraints": {},
+        "metadata": {}
+      },
+      "response": {
+        "type": "success",
+        "id": "fixture-5",
+        "model": "deepseek-chat",
+        "content": "Einstein's theory of relativity revolutionized physics by showing that space and time are intertwined as a single spacetime fabric curved by mass and energy, and that the speed of light is the universal speed limit.",
+        "tokens_in": 20,
+        "tokens_out": 46,
+        "finish_reason": "stop"
+      }
+    },
+    {
+      "request": {
+        "tier": "max",
+        "messages": [
+          {"role": "user", "content": "Summarize the theory of relativity in one sentence."}
+        ],
+        "max_tokens": null,
+        "stream": false,
+        "constraints": {},
+        "metadata": {}
+      },
+      "response": {
+        "type": "success",
+        "id": "fixture-6",
+        "model": "claude-sonnet-4-6",
+        "content": "Einstein's theory of relativity (special and general) fundamentally reshaped physics by demonstrating that the speed of light is constant for all observers, that mass and energy are equivalent (E=mc²), and that gravity arises not as a force but as the curvature of spacetime caused by mass and energy.",
+        "tokens_in": 20,
+        "tokens_out": 65,
+        "finish_reason": "stop"
+      }
+    }
+  ]
+}

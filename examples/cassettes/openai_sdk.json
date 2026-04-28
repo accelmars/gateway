@@ -1,0 +1,28 @@
+{
+  "schema_version": "1",
+  "provider": "mock",
+  "recorded_at": "2026-04-28T00:00:00Z",
+  "entries": [
+    {
+      "request": {
+        "tier": "standard",
+        "messages": [
+          {"role": "user", "content": "Explain gradient descent in one sentence."}
+        ],
+        "max_tokens": null,
+        "stream": false,
+        "constraints": {},
+        "metadata": {}
+      },
+      "response": {
+        "type": "success",
+        "id": "fixture-3",
+        "model": "deepseek-chat",
+        "content": "Gradient descent is an optimization algorithm that iteratively adjusts model parameters in the direction that minimizes the loss function, moving step-by-step toward the lowest point of the error landscape.",
+        "tokens_in": 18,
+        "tokens_out": 40,
+        "finish_reason": "stop"
+      }
+    }
+  ]
+}

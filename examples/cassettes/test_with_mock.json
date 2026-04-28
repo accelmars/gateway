@@ -1,0 +1,112 @@
+{
+  "schema_version": "1",
+  "provider": "mock",
+  "recorded_at": "2026-04-28T00:00:00Z",
+  "entries": [
+    {
+      "request": {
+        "tier": "standard",
+        "messages": [
+          {"role": "user", "content": "Hello"}
+        ],
+        "max_tokens": null,
+        "stream": false,
+        "constraints": {},
+        "metadata": {}
+      },
+      "response": {
+        "type": "success",
+        "id": "fixture-7",
+        "model": "deepseek-chat",
+        "content": "Hello! How can I help you today?",
+        "tokens_in": 10,
+        "tokens_out": 9,
+        "finish_reason": "stop"
+      }
+    },
+    {
+      "request": {
+        "tier": "standard",
+        "messages": [
+          {"role": "user", "content": "Say hello"}
+        ],
+        "max_tokens": null,
+        "stream": true,
+        "constraints": {},
+        "metadata": {}
+      },
+      "response": {
+        "type": "success",
+        "id": "fixture-8",
+        "model": "deepseek-chat",
+        "content": "Hello there!",
+        "tokens_in": 10,
+        "tokens_out": 3,
+        "finish_reason": "stop"
+      }
+    },
+    {
+      "request": {
+        "tier": "quick",
+        "messages": [
+          {"role": "user", "content": "Ping"}
+        ],
+        "max_tokens": null,
+        "stream": false,
+        "constraints": {},
+        "metadata": {}
+      },
+      "response": {
+        "type": "success",
+        "id": "fixture-9",
+        "model": "gemini-2.5-flash-lite",
+        "content": "Pong!",
+        "tokens_in": 5,
+        "tokens_out": 2,
+        "finish_reason": "stop"
+      }
+    },
+    {
+      "request": {
+        "tier": "standard",
+        "messages": [
+          {"role": "user", "content": "Ping"}
+        ],
+        "max_tokens": null,
+        "stream": false,
+        "constraints": {},
+        "metadata": {}
+      },
+      "response": {
+        "type": "success",
+        "id": "fixture-10",
+        "model": "deepseek-chat",
+        "content": "Pong!",
+        "tokens_in": 5,
+        "tokens_out": 2,
+        "finish_reason": "stop"
+      }
+    },
+    {
+      "request": {
+        "tier": "max",
+        "messages": [
+          {"role": "user", "content": "Ping"}
+        ],
+        "max_tokens": null,
+        "stream": false,
+        "constraints": {},
+        "metadata": {}
+      },
+      "response": {
+        "type": "success",
+        "id": "fixture-11",
+        "model": "claude-sonnet-4-6",
+        "content": "Pong!",
+        "tokens_in": 5,
+        "tokens_out": 2,
+        "finish_reason": "stop"
+      }
+    }
+  ]
+}

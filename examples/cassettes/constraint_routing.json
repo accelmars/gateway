@@ -1,0 +1,49 @@
+{
+  "schema_version": "1",
+  "provider": "mock",
+  "recorded_at": "2026-04-28T00:00:00Z",
+  "entries": [
+    {
+      "request": {
+        "tier": "standard",
+        "messages": [
+          {"role": "user", "content": "Summarize the privacy policy implications of large-scale data collection."}
+        ],
+        "max_tokens": null,
+        "stream": false,
+        "constraints": {},
+        "metadata": {"privacy": "open"}
+      },
+      "response": {
+        "type": "success",
+        "id": "fixture-12",
+        "model": "deepseek-chat",
+        "content": "Large-scale data collection raises significant privacy concerns including unauthorized surveillance, increased risk of data breaches, and erosion of individuals' autonomy over their personal information, requiring robust policy frameworks to balance organizational interests with individual rights.",
+        "tokens_in": 22,
+        "tokens_out": 45,
+        "finish_reason": "stop"
+      }
+    },
+    {
+      "request": {
+        "tier": "standard",
+        "messages": [
+          {"role": "user", "content": "Summarize the privacy policy implications of large-scale data collection."}
+        ],
+        "max_tokens": null,
+        "stream": false,
+        "constraints": {},
+        "metadata": {"privacy": "sensitive"}
+      },
+      "response": {
+        "type": "success",
+        "id": "fixture-13",
+        "model": "openrouter",
+        "content": "Large-scale data collection raises significant privacy concerns including unauthorized surveillance, increased risk of data breaches, and erosion of individuals' autonomy over their personal information, requiring robust policy frameworks to balance organizational interests with individual rights.",
+        "tokens_in": 22,
+        "tokens_out": 45,
+        "finish_reason": "stop"
+      }
+    }
+  ]
+}
