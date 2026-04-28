@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "accelmars-gateway"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "accelmars-gateway-core",
  "anyhow",
@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "accelmars-gateway-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
