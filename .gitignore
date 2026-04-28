@@ -1,5 +1,7 @@
 /target/
 /examples/rust/target/
+/examples/community-provider/target/
+/examples/community-provider/Cargo.lock
 .env
 .env.*
 gateway.db

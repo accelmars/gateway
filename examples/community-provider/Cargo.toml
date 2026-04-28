@@ -1,0 +1,15 @@
+[package]
+name = "community-provider-example"
+version = "0.1.0"
+edition = "2021"
+description = "Example: implementing ProviderAdapter to add a community provider to AccelMars Gateway"
+publish = false
+
+[lib]
+name = "community_provider"
+path = "src/lib.rs"
+
+[dependencies]
+accelmars-gateway-core = { path = "../../crates/accelmars-gateway-core" }
+
+[workspace]
