@@ -37,6 +37,43 @@ use accelmars_gateway::server::serve_with_listener;
 use accelmars_gateway_core::MockAdapter;
 use tokio::net::TcpListener;
 
+/// Start a server and return both the base URL and the shared `CostTracker` for verification.
+async fn start_test_server_with_shared_cost_tracker() -> (String, Arc<CostTracker>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+
+    let mut config = GatewayConfig::default();
+    config.mode = accelmars_gateway::config::GatewayMode::Mock;
+
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MockAdapter::default()));
+
+    let router = Arc::new(Router::new(config, registry));
+    let limiter = Arc::new(ConcurrencyLimiter::new(20));
+
+    let cost_tracker = Arc::new(CostTracker::open(std::path::Path::new(":memory:")).unwrap());
+    let cost_tracker_for_test = Arc::clone(&cost_tracker);
+    let auth_store = Arc::new(AuthStore::in_memory().unwrap());
+
+    tokio::spawn(async move {
+        serve_with_listener(
+            listener,
+            router,
+            limiter,
+            cost_tracker,
+            auth_store,
+            true,
+            port,
+        )
+        .await
+        .ok();
+    });
+    tokio::task::yield_now().await;
+
+    (format!("http://{addr}"), cost_tracker_for_test)
+}
+
 /// Bind port 0, start the server in mock mode with auth disabled, return the base URL.
 async fn start_test_server() -> String {
     start_test_server_with_max_concurrent(20).await
@@ -957,5 +994,50 @@ async fn auth_disabled_allows_requests_without_key() {
         resp.status(),
         200,
         "auth_disabled server must accept requests without a key"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: X-AccelMars-Context header populates cost record (GI-023)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn context_header_populates_cost_record() {
+    let (base, cost_tracker) = start_test_server_with_shared_cost_tracker().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header(
+            "X-AccelMars-Context",
+            r#"{"engine":"cortex","contract_id":"CI-003","task_type":"extraction"}"#,
+        )
+        .json(&serde_json::json!({
+            "model": "quick",
+            "messages": [{"role": "user", "content": "test context header"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    // Cost record is written synchronously before the response is returned.
+    let (engine, contract_id, task_type): (Option<String>, Option<String>, Option<String>) =
+        cost_tracker.last_record_metadata().unwrap();
+    assert_eq!(
+        engine.as_deref(),
+        Some("cortex"),
+        "engine must match header value"
+    );
+    assert_eq!(
+        contract_id.as_deref(),
+        Some("CI-003"),
+        "contract_id must match header value"
+    );
+    assert_eq!(
+        task_type.as_deref(),
+        Some("extraction"),
+        "task_type must match header value"
     );
 }

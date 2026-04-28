@@ -25,6 +25,12 @@ pub struct RequestRecord {
     pub constraints: Option<String>,
     /// API key ID that made this request — used for per-key cost attribution (Phase 2/3 billing).
     pub key_id: Option<String>,
+    /// Engine that originated the request (e.g., "cortex", "guild"). From X-AccelMars-Context.
+    pub engine: Option<String>,
+    /// Contract ID being executed. From X-AccelMars-Context.
+    pub contract_id: Option<String>,
+    /// Task classification hint. From X-AccelMars-Context.
+    pub task_type: Option<String>,
 }
 
 /// Aggregated stats returned by `CostTracker::summary()`.
@@ -110,8 +116,11 @@ impl CostTracker {
                 key_id      TEXT
             );",
         )?;
-        // Migrate existing databases — silently ignored if column already exists
+        // Migrate existing databases — ignore SqliteFailure with code 1 (duplicate column).
         let _ = conn.execute("ALTER TABLE requests ADD COLUMN key_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE requests ADD COLUMN engine TEXT", []);
+        let _ = conn.execute("ALTER TABLE requests ADD COLUMN contract_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE requests ADD COLUMN task_type TEXT", []);
         Ok(())
     }
 
@@ -127,8 +136,9 @@ impl CostTracker {
         if let Err(e) = conn.execute(
             "INSERT OR IGNORE INTO requests
                 (id, timestamp, tier, provider, model, tokens_in, tokens_out,
-                 cost_usd, latency_ms, status, error_type, constraints, key_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 cost_usd, latency_ms, status, error_type, constraints, key_id,
+                 engine, contract_id, task_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 &record.id,
                 &record.timestamp,
@@ -143,6 +153,9 @@ impl CostTracker {
                 &record.error_type,
                 &record.constraints,
                 &record.key_id,
+                &record.engine,
+                &record.contract_id,
+                &record.task_type,
             ],
         ) {
             warn!("cost tracker write error (fail-open) — request still completed: {e}");
@@ -216,6 +229,18 @@ impl CostTracker {
         })
     }
 
+    /// Retrieve engine/contract_id/task_type from the most-recently inserted row.
+    /// Used by integration tests to verify header-to-cost-record propagation.
+    pub fn last_record_metadata(&self) -> Option<(Option<String>, Option<String>, Option<String>)> {
+        let conn = self.conn.lock().expect("cost tracker lock poisoned");
+        conn.query_row(
+            "SELECT engine, contract_id, task_type FROM requests ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok()
+    }
+
     /// Calculate cost for a completed request given the provider's pricing.
     pub fn calculate_cost(
         tokens_in: u64,
@@ -260,6 +285,9 @@ mod tests {
             error_type: None,
             constraints: None,
             key_id: None,
+            engine: None,
+            contract_id: None,
+            task_type: None,
         }
     }
 
@@ -312,6 +340,9 @@ mod tests {
             error_type: None,
             constraints: None,
             key_id: None,
+            engine: None,
+            contract_id: None,
+            task_type: None,
         });
         tracker.record(&RequestRecord {
             id: "r2".to_string(),
@@ -327,6 +358,9 @@ mod tests {
             error_type: None,
             constraints: None,
             key_id: None,
+            engine: None,
+            contract_id: None,
+            task_type: None,
         });
 
         let summary = tracker.summary(None).unwrap();
@@ -359,6 +393,9 @@ mod tests {
             error_type: None,
             constraints: None,
             key_id: None,
+            engine: None,
+            contract_id: None,
+            task_type: None,
         });
         tracker.record(&RequestRecord {
             id: "new".to_string(),
@@ -374,6 +411,9 @@ mod tests {
             error_type: None,
             constraints: None,
             key_id: None,
+            engine: None,
+            contract_id: None,
+            task_type: None,
         });
 
         let all = tracker.summary(None).unwrap();

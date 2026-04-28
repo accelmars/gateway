@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -16,8 +17,8 @@ use tracing::{error, info, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use accelmars_gateway_core::{
-    AdapterError, Capability, CostPreference, GatewayRequest, Latency, Message, ModelTier, Privacy,
-    RoutingConstraints,
+    metadata::from_request_metadata, AdapterError, Capability, CostPreference, GatewayRequest,
+    Latency, Message, ModelTier, Privacy, RoutingConstraints,
 };
 
 use crate::auth::AuthStore;
@@ -295,6 +296,7 @@ async fn handle_status(State(state): State<AppState>) -> Response {
 async fn handle_completion(
     State(state): State<AppState>,
     key_id: Option<axum::extract::Extension<String>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
     let span = tracing::info_span!("chat_completion");
@@ -325,6 +327,37 @@ async fn handle_completion(
 
         let constraints = parse_constraints(&req);
         let is_stream = req.stream.unwrap_or(false);
+
+        // Build metadata HashMap from request body, then merge X-AccelMars-Context header.
+        // Absent header = no-op. Malformed JSON = warn + ignore (fail-open, Rule 12).
+        let mut req_metadata: HashMap<String, serde_json::Value> = req
+            .metadata
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        if let Some(ctx_header) = headers.get("x-accelmars-context") {
+            match ctx_header.to_str() {
+                Ok(s) => match serde_json::from_str::<serde_json::Value>(s) {
+                    Ok(serde_json::Value::Object(map)) => {
+                        for (k, v) in map {
+                            req_metadata.insert(k, v);
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::warn!("X-AccelMars-Context header is not a JSON object — ignored")
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "X-AccelMars-Context header is malformed JSON — ignored: {e}"
+                        )
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("X-AccelMars-Context header is not valid UTF-8 — ignored: {e}")
+                }
+            }
+        }
 
         // Extract engine identifier from metadata (cortex, guild, etc.)
         let engine = req
@@ -395,7 +428,7 @@ async fn handle_completion(
                 .collect(),
             max_tokens: req.max_tokens,
             stream: is_stream,
-            metadata: Default::default(),
+            metadata: req_metadata,
         };
 
         let overhead_ms = resolve_start.elapsed().as_millis() as u64;
@@ -473,6 +506,8 @@ async fn complete_json(
     key_id: Option<String>,
     overhead_ms: u64,
 ) -> Response {
+    let req_meta = from_request_metadata(&gateway_req);
+
     // Retry loop: up to 3 attempts, re-resolving via the fallback chain on each adapter failure.
     // The concurrency permit (_permit in handle_completion) covers the entire loop — one slot
     // per request regardless of how many fallback attempts are made.
@@ -510,6 +545,9 @@ async fn complete_json(
                     error_type: Some("internal_error".to_string()),
                     constraints: None,
                     key_id,
+                    engine: req_meta.engine.clone(),
+                    contract_id: req_meta.contract_id.clone(),
+                    task_type: req_meta.task_type.clone(),
                 });
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -545,6 +583,9 @@ async fn complete_json(
                     error_type: Some(adapter_error_type(&adapter_err).to_string()),
                     constraints: None,
                     key_id: key_id.clone(),
+                    engine: req_meta.engine.clone(),
+                    contract_id: req_meta.contract_id.clone(),
+                    task_type: req_meta.task_type.clone(),
                 });
 
                 // Try to re-resolve through the fallback chain (circuit is now OPEN for
@@ -637,6 +678,9 @@ async fn complete_json(
                     error_type: None,
                     constraints: None,
                     key_id,
+                    engine: req_meta.engine.clone(),
+                    contract_id: req_meta.contract_id.clone(),
+                    task_type: req_meta.task_type.clone(),
                 });
 
                 let now = unix_now();
@@ -692,6 +736,8 @@ async fn complete_stream(
     key_id: Option<String>,
     overhead_ms: u64,
 ) -> Response {
+    let req_meta = from_request_metadata(&gateway_req);
+
     // Same retry-on-fallback pattern as complete_json. The concurrency permit
     // covers the entire retry loop — one slot per request.
     const MAX_ATTEMPTS: u32 = 3;
@@ -826,6 +872,9 @@ async fn complete_stream(
                     error_type: None,
                     constraints: None,
                     key_id,
+                    engine: req_meta.engine.clone(),
+                    contract_id: req_meta.contract_id.clone(),
+                    task_type: req_meta.task_type.clone(),
                 });
 
                 let now = unix_now();
