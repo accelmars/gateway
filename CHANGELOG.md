@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [accelmars-gateway-v0.4.0] - 2026-04-28
+## [0.4.0] - 2026-04-28
 
 ### Features
 - RoutingStrategy trait and RequestMetadata struct — extension points for contract-aware routing; X-AccelMars-Context header carries engine, contract_id, task_type, and budget_usd per request (#50) ([#50](https://github.com/accelmars/gateway/pull/50))
@@ -21,7 +21,7 @@ All notable changes to this project will be documented in this file.
 - Add CASSETTE-SPEC.md — public cassette format specification (Wave A) (#47) ([#47](https://github.com/accelmars/gateway/pull/47))
 - Add TESTING.md — mock, fixture, and cassette testing guide (Wave A) (#46) ([#46](https://github.com/accelmars/gateway/pull/46))
 
-## [accelmars-gateway-v0.3.0] - 2026-04-27
+## [0.3.0] - 2026-04-27
 
 ### Features
 - Streaming cassette format — StreamingSuccess variant enables multi-chunk SSE fixtures; schema v2 gate rejects invalid cassettes at load; FixtureAdapter.complete_chunks() returns pre-authored chunks without touching live providers (#37) ([#37](https://github.com/accelmars/gateway/pull/37))
@@ -49,7 +49,7 @@ All notable changes to this project will be documented in this file.
 ### Documentation
 - Client integration guide — quick start, tier strings, routing constraints, error codes, and reference implementations for cortex and guild (#23) ([#23](https://github.com/accelmars/gateway/pull/23))
 
-## [accelmars-gateway-v0.2.0] - 2026-04-20
+## [0.2.0] - 2026-04-20
 
 ### Features
 - Close PF-005 DONE A — concurrency semaphore, SQLite cost tracking, gateway status/stats/complete (#11) ([#11](https://github.com/accelmars/gateway/pull/11))
@@ -61,7 +61,7 @@ All notable changes to this project will be documented in this file.
 ### Bug Fixes
 - Correct cliff.toml link template (url→href, index→text) (#14) ([#14](https://github.com/accelmars/gateway/pull/14))
 
-## [accelmars-gateway-v0.1.0] - 2026-04-19
+## [0.1.0] - 2026-04-19
 
 ### Features
 - Initial workspace scaffold with core types, CI, and release automation (#1) ([#1](https://github.com/accelmars/gateway/pull/1))
