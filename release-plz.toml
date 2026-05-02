@@ -8,3 +8,13 @@ publish = false
 git_release_enable = false
 # Enforce package-prefixed tags: accelmars-gateway-v{version}
 git_tag_name = "{{ package }}-v{{ version }}"
+
+# Do not manage per-package changelogs — root CHANGELOG.md is owned by git-cliff
+# and is what cargo-dist reads for GitHub Release notes.
+[[package]]
+name = "accelmars-gateway"
+changelog_update = false
+
+[[package]]
+name = "accelmars-gateway-core"
+changelog_update = false
