@@ -28,7 +28,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
 
       - name: Run release-plz
+        id: release-plz
         uses: MarcoIeni/release-plz-action@v0.5.128
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Auto-merge release PR
+        if: ${{ steps.release-plz.outputs.prs != '[]' }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          echo '${{ steps.release-plz.outputs.prs }}' | jq -c '.[]' | while IFS= read -r pr; do
+            pr_number=$(echo "$pr" | jq -r '.number')
+            gh pr merge --auto --squash "$pr_number"
+          done
