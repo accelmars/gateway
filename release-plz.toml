@@ -3,6 +3,8 @@ changelog_config = "cliff.toml"
 # Disable crates.io publishing until we're ready to release publicly.
 # Remove this line when CARGO_REGISTRY_TOKEN is configured and crates are publish-ready.
 publish = false
+# Required when publish = false: tells release-plz to use git tags as version baseline instead of crates.io.
+git_only = true
 # cargo-dist owns GitHub Release creation (with binary assets).
 # release-plz creates git tags only; GitHub Releases are created by cargo-dist.
 git_release_enable = false
