@@ -17,7 +17,7 @@ name = "gateway"
 path = "src/main.rs"
 
 [dependencies]
-accelmars-gateway-core = { path = "../accelmars-gateway-core" }
+accelmars-gateway-core = { workspace = true }
 anyhow = "1"
 config = { version = "0.14", features = ["toml"] }
 thiserror = "2"
